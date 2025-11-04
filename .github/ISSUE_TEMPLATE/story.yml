@@ -1,0 +1,156 @@
+name: Story
+description: Implementable unit of work with clear deliverable
+title: "[Story] "
+labels: ["type:story"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Story Template
+        Use this for concrete, implementable units of work that deliver specific value.
+        Should be completable within a single sprint/iteration.
+
+  - type: input
+    id: parent-spec
+    attributes:
+      label: Parent Spec
+      description: "Link to parent feature/spec issue (format: #123)"
+      placeholder: "#45"
+    validations:
+      required: false
+
+  - type: textarea
+    id: user-story
+    attributes:
+      label: User Story
+      description: Describe from user perspective (As a... I want... So that...)
+      placeholder: |
+        As a registered user
+        I want to log in with my email and password
+        So that I can securely access my account
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Detailed description of what needs to be implemented
+      placeholder: |
+        Implement the login endpoint that accepts email/password credentials,
+        validates them against the database, and returns a JWT token upon success.
+        
+        This includes:
+        - Creating the POST /api/auth/login endpoint
+        - Implementing password verification
+        - Generating JWT tokens
+        - Handling error cases (invalid credentials, locked accounts, etc.)
+    validations:
+      required: true
+
+  - type: textarea
+    id: technical-details
+    attributes:
+      label: Technical Details
+      description: Implementation notes, algorithms, or technical approach
+      placeholder: |
+        - Use bcrypt.compare() for password verification
+        - JWT payload should include: userId, email, roles
+        - Token expiry: 24 hours
+        - Use middleware pattern for request validation
+        - Rate limiting: 5 attempts per 15 minutes per IP
+    validations:
+      required: false
+
+  - type: textarea
+    id: subtasks
+    attributes:
+      label: Subtasks
+      description: "Breakdown into technical tasks (will become sub-issues). Use format: - [ ] #123"
+      placeholder: |
+        - [ ] #60 Implement JWT middleware
+        - [ ] #61 Create login endpoint handler
+        - [ ] #62 Add password verification logic
+        - [ ] #63 Write integration tests
+        - [ ] #64 Add API documentation
+      value: |
+        - [ ] 
+    validations:
+      required: false
+
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance Criteria
+      description: Specific, testable conditions that must be met for this story to be complete
+      placeholder: |
+        - [ ] POST /api/auth/login endpoint responds to requests
+        - [ ] Valid credentials return 200 with JWT token
+        - [ ] Invalid credentials return 401 with error message
+        - [ ] Locked accounts return 403 with appropriate message
+        - [ ] Rate limiting triggers after 5 failed attempts
+        - [ ] Integration tests pass with 100% coverage
+        - [ ] API documentation updated
+    validations:
+      required: true
+
+  - type: textarea
+    id: test-scenarios
+    attributes:
+      label: Test Scenarios
+      description: Key test cases that should be covered
+      placeholder: |
+        1. Valid credentials → Success with token
+        2. Invalid email → 401 error
+        3. Invalid password → 401 error
+        4. Account locked → 403 error
+        5. Rate limit exceeded → 429 error
+        6. Malformed request → 400 error
+    validations:
+      required: false
+
+  - type: input
+    id: estimate
+    attributes:
+      label: Story Points / Estimate
+      description: Rough complexity estimate
+      placeholder: "5 points / 2 days"
+    validations:
+      required: false
+
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies
+      description: What needs to be completed before this can be started?
+      placeholder: |
+        - User database schema (#40)
+        - JWT library integrated (#41)
+        - Rate limiting middleware (#42)
+    validations:
+      required: false
+
+  - type: textarea
+    id: design-mockups
+    attributes:
+      label: Design / Mockups
+      description: Links to designs, mockups, or UI specifications (if applicable)
+      placeholder: |
+        - Login form mockup: [Figma link]
+        - Error states: [Screenshot]
+    validations:
+      required: false
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      description: How urgent is this story?
+      options:
+        - Critical
+        - High
+        - Medium
+        - Low
+      default: 2
+    validations:
+      required: false

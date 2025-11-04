@@ -1,0 +1,221 @@
+name: Spec
+description: Detailed specification for a feature or major capability
+title: "[Spec] "
+labels: ["type:spec", "status:draft"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Spec Template
+        Use this for detailed technical specifications that describe how a feature will be implemented.
+        This should be comprehensive enough to guide implementation without ambiguity.
+
+  - type: input
+    id: parent-epic
+    attributes:
+      label: Parent Epic
+      description: "Link to parent epic issue (format: #123)"
+      placeholder: "#10"
+    validations:
+      required: false
+
+  - type: textarea
+    id: overview
+    attributes:
+      label: Overview
+      description: Brief description of what this feature does and why it's needed
+      placeholder: |
+        This feature enables users to authenticate using email/password credentials,
+        providing secure access to the platform with JWT-based session management.
+    validations:
+      required: true
+
+  - type: textarea
+    id: requirements
+    attributes:
+      label: Requirements
+      description: Functional and non-functional requirements
+      placeholder: |
+        **Functional Requirements:**
+        - Users can register with email and password
+        - Users can login with credentials
+        - Passwords must be hashed using bcrypt
+        - Failed login attempts are rate-limited
+        
+        **Non-Functional Requirements:**
+        - Login response time < 500ms (p95)
+        - Support 1000 concurrent login requests
+        - 99.9% uptime
+    validations:
+      required: true
+
+  - type: textarea
+    id: architecture
+    attributes:
+      label: Architecture & Design
+      description: High-level architecture, components, and design decisions
+      placeholder: |
+        **Components:**
+        - Authentication Service (Node.js)
+        - JWT Token Service
+        - User Database (PostgreSQL)
+        
+        **Flow:**
+        1. User submits credentials
+        2. Service validates against database
+        3. Generate JWT token with 24h expiry
+        4. Return token + refresh token
+        
+        **Design Decisions:**
+        - Using JWT over session cookies for stateless auth
+        - bcrypt with cost factor 12 for password hashing
+        - Redis for rate limiting
+    validations:
+      required: true
+
+  - type: textarea
+    id: api-contracts
+    attributes:
+      label: API Contracts / Interfaces
+      description: API endpoints, request/response formats, or interface definitions
+      placeholder: |
+        ```
+        POST /api/auth/login
+        Request:
+        {
+          "email": "user@example.com",
+          "password": "securepass"
+        }
+        
+        Response (200):
+        {
+          "token": "eyJhbGc...",
+          "refreshToken": "refresh...",
+          "expiresIn": 86400
+        }
+        
+        Response (401):
+        {
+          "error": "Invalid credentials"
+        }
+        ```
+    validations:
+      required: false
+
+  - type: textarea
+    id: data-models
+    attributes:
+      label: Data Models
+      description: Database schemas, data structures, or entity definitions
+      placeholder: |
+        ```sql
+        CREATE TABLE users (
+          id UUID PRIMARY KEY,
+          email VARCHAR(255) UNIQUE NOT NULL,
+          password_hash VARCHAR(255) NOT NULL,
+          created_at TIMESTAMP DEFAULT NOW(),
+          last_login TIMESTAMP
+        );
+        ```
+    validations:
+      required: false
+
+  - type: textarea
+    id: implementation-plan
+    attributes:
+      label: Implementation Plan
+      description: "Breakdown into stories/tasks (will become sub-issues). Use format: - [ ] #123"
+      placeholder: |
+        - [ ] #50 Login with email/password
+        - [ ] #51 Password reset flow
+        - [ ] #52 Rate limiting for failed attempts
+        - [ ] #53 JWT token refresh mechanism
+      value: |
+        - [ ] 
+    validations:
+      required: false
+
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance Criteria
+      description: Specific, testable criteria that must be met for this spec to be considered complete
+      placeholder: |
+        - [ ] User can successfully register with email/password
+        - [ ] User can login with valid credentials
+        - [ ] Invalid credentials return 401 error
+        - [ ] Rate limiting blocks after 5 failed attempts
+        - [ ] JWT tokens expire after 24 hours
+        - [ ] All endpoints have integration tests
+        - [ ] API documentation is complete
+        - [ ] Security review passed
+    validations:
+      required: true
+
+  - type: textarea
+    id: security-considerations
+    attributes:
+      label: Security Considerations
+      description: Security requirements, threat model, or security review notes
+      placeholder: |
+        - Passwords hashed with bcrypt (cost 12)
+        - Protection against timing attacks
+        - Rate limiting on login endpoint
+        - JWT secrets rotated quarterly
+        - Input validation and sanitization
+    validations:
+      required: false
+
+  - type: textarea
+    id: testing-strategy
+    attributes:
+      label: Testing Strategy
+      description: How this feature will be tested
+      placeholder: |
+        - Unit tests for authentication logic
+        - Integration tests for API endpoints
+        - Load testing for 1000 concurrent users
+        - Security penetration testing
+        - Manual QA test cases
+    validations:
+      required: false
+
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies & Prerequisites
+      description: What needs to be completed before this can be implemented?
+      placeholder: |
+        - Database migration framework (#12)
+        - JWT library selection and approval
+        - Redis instance provisioned
+    validations:
+      required: false
+
+  - type: textarea
+    id: open-questions
+    attributes:
+      label: Open Questions
+      description: Unresolved questions or decisions that need to be made
+      placeholder: |
+        - Should we support magic link authentication in this spec?
+        - What's the refresh token expiry policy?
+        - Do we need to support concurrent sessions?
+    validations:
+      required: false
+
+  - type: dropdown
+    id: status
+    attributes:
+      label: Spec Status
+      description: Current status of this specification
+      options:
+        - Draft
+        - Under Review
+        - Approved
+        - In Progress
+        - Completed
+        - On Hold
+      default: 0
+    validations:
+      required: true

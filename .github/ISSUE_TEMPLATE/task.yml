@@ -1,0 +1,157 @@
+name: Task
+description: Granular work item (implementation, bug fix, or test)
+title: "[Task] "
+labels: ["type:task"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Task Template
+        Use this for specific, granular work. Should be completable in a few hours to a day.
+
+  - type: input
+    id: parent-story
+    attributes:
+      label: Parent Story
+      description: "Link to parent story/task issue (format: #123)"
+      placeholder: "#50"
+    validations:
+      required: false
+
+  - type: dropdown
+    id: task-type
+    attributes:
+      label: Task Type
+      description: What type of work is this?
+      options:
+        - Implementation
+        - Bug Fix
+        - Test
+        - Refactor
+        - Documentation
+        - Investigation
+        - Infrastructure
+      default: 0
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Clear, concise description of what needs to be done
+      placeholder: |
+        Implement the JWT middleware function that validates incoming tokens
+        and attaches the decoded user information to the request object.
+    validations:
+      required: true
+
+  - type: textarea
+    id: technical-approach
+    attributes:
+      label: Technical Approach
+      description: How should this be implemented? Specific code patterns or algorithms
+      placeholder: |
+        1. Create middleware function `authenticateJWT(req, res, next)`
+        2. Extract token from Authorization header
+        3. Verify token using jwt.verify() with secret key
+        4. Decode payload and attach to req.user
+        5. Handle errors: expired, invalid, missing tokens
+        6. Call next() on success
+        
+        Use the jsonwebtoken library's verify method with our JWT_SECRET from env.
+    validations:
+      required: false
+
+  - type: textarea
+    id: files-affected
+    attributes:
+      label: Files to Create/Modify
+      description: List of files that will be created or changed
+      placeholder: |
+        - src/middleware/auth.js (new)
+        - src/middleware/index.js (modify - export new middleware)
+        - tests/middleware/auth.test.js (new)
+    validations:
+      required: false
+
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance Criteria
+      description: Checklist of requirements for this task to be complete
+      placeholder: |
+        - [ ] Middleware function created and exported
+        - [ ] Valid tokens are successfully verified
+        - [ ] Expired tokens return 401 with "Token expired" message
+        - [ ] Invalid tokens return 401 with "Invalid token" message
+        - [ ] Missing tokens return 401 with "No token provided" message
+        - [ ] User info is correctly attached to req.user
+        - [ ] Unit tests achieve 100% code coverage
+        - [ ] Code follows project style guide
+      value: |
+        - [ ] 
+    validations:
+      required: true
+
+  - type: textarea
+    id: testing-notes
+    attributes:
+      label: Testing Notes
+      description: How to test this change
+      placeholder: |
+        **Unit Tests:**
+        - Mock jwt.verify() to test success/failure cases
+        - Test error handling for expired/invalid/missing tokens
+        
+        **Manual Testing:**
+        - Use Postman to send requests with valid/invalid tokens
+        - Verify req.user is populated correctly
+    validations:
+      required: false
+
+  - type: input
+    id: estimate
+    attributes:
+      label: Time Estimate
+      description: Rough time estimate to complete
+      placeholder: "4 hours"
+    validations:
+      required: false
+
+  - type: textarea
+    id: blockers
+    attributes:
+      label: Blockers / Prerequisites
+      description: What's blocking this or needs to be done first?
+      placeholder: |
+        - JWT_SECRET environment variable must be configured
+        - jsonwebtoken package must be installed
+    validations:
+      required: false
+
+  - type: textarea
+    id: references
+    attributes:
+      label: References
+      description: Links to docs, examples, or related resources
+      placeholder: |
+        - JWT middleware pattern: https://example.com/jwt-auth
+        - jsonwebtoken docs: https://github.com/auth0/node-jsonwebtoken
+        - Similar implementation in Project X: [link]
+    validations:
+      required: false
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      description: How urgent is this task?
+      options:
+        - Blocker
+        - High
+        - Medium
+        - Low
+      default: 2
+    validations:
+      required: false

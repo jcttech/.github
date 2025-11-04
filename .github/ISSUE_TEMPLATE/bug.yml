@@ -1,0 +1,168 @@
+name: Bug
+description: Report a defect or unexpected behavior
+title: "[Bug] "
+labels: ["type:bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Bug Template
+        Use this to report defects, errors, or unexpected behavior in the system.
+
+  - type: input
+    id: related-issue
+    attributes:
+      label: Related Issue
+      description: "Link to related epic/spec/story if applicable (format: #123)"
+      placeholder: "#50"
+    validations:
+      required: false
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: Clear, concise description of the bug
+      placeholder: "JWT tokens are not being validated correctly, allowing expired tokens to pass authentication"
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: Expected Behavior
+      description: What should happen?
+      placeholder: |
+        Expired JWT tokens should be rejected with a 401 status and 
+        "Token expired" error message.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual-behavior
+    attributes:
+      label: Actual Behavior
+      description: What actually happens?
+      placeholder: |
+        Expired tokens are accepted and users can access protected resources
+        even after their token has expired.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps-to-reproduce
+    attributes:
+      label: Steps to Reproduce
+      description: Step-by-step instructions to reproduce the bug
+      placeholder: |
+        1. Login to get a JWT token
+        2. Wait for token to expire (24 hours)
+        3. Make a request to /api/user/profile with expired token
+        4. Request succeeds when it should fail with 401
+      value: |
+        1. 
+        2. 
+        3. 
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Where does this bug occur?
+      placeholder: |
+        - Environment: Production
+        - Version: v1.2.3
+        - Browser: Chrome 120
+        - OS: macOS 14
+        - API Server: Node.js v20.10
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs-errors
+    attributes:
+      label: Logs / Error Messages
+      description: Relevant log output or error messages
+      placeholder: |
+        ```
+        [2024-01-15 10:23:45] INFO: Token validation passed
+        [2024-01-15 10:23:45] DEBUG: Token exp: 1705305825 (expired)
+        [2024-01-15 10:23:45] INFO: User authenticated successfully
+        ```
+      render: shell
+    validations:
+      required: false
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      description: How severe is this bug?
+      options:
+        - Critical - System unusable / Data loss
+        - High - Major feature broken
+        - Medium - Feature partially broken
+        - Low - Minor issue / Cosmetic
+      default: 2
+    validations:
+      required: true
+
+  - type: dropdown
+    id: frequency
+    attributes:
+      label: Frequency
+      description: How often does this occur?
+      options:
+        - Always (100%)
+        - Often (75%)
+        - Sometimes (50%)
+        - Rarely (25%)
+        - Once
+      default: 0
+    validations:
+      required: true
+
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact
+      description: What's the business/user impact of this bug?
+      placeholder: |
+        Security vulnerability allowing unauthorized access to user accounts.
+        Affects all users. High risk of data breach.
+    validations:
+      required: false
+
+  - type: textarea
+    id: possible-fix
+    attributes:
+      label: Possible Fix
+      description: If you have an idea of how to fix this, describe it here
+      placeholder: |
+        The JWT middleware is not checking the token expiration claim.
+        Need to add validation for the 'exp' field in the token payload.
+    validations:
+      required: false
+
+  - type: textarea
+    id: workaround
+    attributes:
+      label: Workaround
+      description: Is there a temporary workaround?
+      placeholder: |
+        Manually logging out and back in generates a fresh token.
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional Context
+      description: Screenshots, videos, or other relevant information
+      placeholder: |
+        - Screenshot showing successful request with expired token
+        - Network trace showing the request/response
+    validations:
+      required: false

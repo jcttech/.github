@@ -1,0 +1,124 @@
+name: Epic
+description: Major initiative or body of work spanning multiple features
+title: "[Epic] "
+labels: ["type:epic"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Epic Template
+        Use this for major initiatives that encompass multiple features and represent significant business value.
+        
+  - type: input
+    id: epic-title
+    attributes:
+      label: Epic Title
+      description: Brief, descriptive name for this initiative
+      placeholder: "User Management System"
+    validations:
+      required: true
+
+  - type: textarea
+    id: overview
+    attributes:
+      label: Overview
+      description: High-level description of the initiative and its business value
+      placeholder: |
+        What is this epic trying to achieve?
+        Why is it important to the business/users?
+        What's the expected outcome?
+    validations:
+      required: true
+
+  - type: textarea
+    id: objectives
+    attributes:
+      label: Objectives & Goals
+      description: Specific, measurable objectives this epic aims to achieve
+      placeholder: |
+        - Enable secure user authentication
+        - Support 10,000+ concurrent users
+        - Reduce login time to under 2 seconds
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: What's included and explicitly excluded from this epic
+      placeholder: |
+        **In Scope:**
+        - Email/password authentication
+        - OAuth2 integration
+        - Role-based access control
+        
+        **Out of Scope:**
+        - Multi-factor authentication (future epic)
+        - Social login beyond OAuth2
+    validations:
+      required: true
+
+  - type: textarea
+    id: features
+    attributes:
+      label: Features & Specifications
+      description: "List of feature/spec issues (will become sub-issues). Use format: - [ ] #123"
+      placeholder: |
+        - [ ] #45 User Authentication
+        - [ ] #46 OAuth2 Integration
+        - [ ] #47 Role-Based Access Control
+      value: |
+        - [ ] 
+    validations:
+      required: false
+
+  - type: textarea
+    id: success-criteria
+    attributes:
+      label: Success Criteria
+      description: How will we know this epic is complete and successful?
+      placeholder: |
+        - All authentication flows tested and deployed
+        - Zero security vulnerabilities in penetration testing
+        - Performance metrics meet objectives
+        - Documentation complete
+    validations:
+      required: true
+
+  - type: input
+    id: target-milestone
+    attributes:
+      label: Target Milestone
+      description: Which release/milestone should this epic target?
+      placeholder: "Q1 2025"
+    validations:
+      required: false
+
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies & Risks
+      description: External dependencies, blockers, or known risks
+      placeholder: |
+        **Dependencies:**
+        - Database migration framework (#12)
+        - Email service integration
+        
+        **Risks:**
+        - OAuth provider API changes
+        - Performance impact on legacy systems
+    validations:
+      required: false
+
+  - type: textarea
+    id: stakeholders
+    attributes:
+      label: Stakeholders
+      description: Who needs to be involved or informed? (Optional for solo projects)
+      placeholder: |
+        - Product Owner: @username
+        - Tech Lead: @username
+        - Security Review: @team-security
+    validations:
+      required: false
