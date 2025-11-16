@@ -16,7 +16,7 @@ body:
       description: "Link to related epic/spec/story if applicable (format: #123)"
       placeholder: "#50"
     validations:
-      required: false
+      required: true
 
   - type: textarea
     id: description

@@ -17,7 +17,7 @@ body:
       description: "Link to parent epic issue (format: #123)"
       placeholder: "#10"
     validations:
-      required: false
+      required: true
 
   - type: textarea
     id: overview

@@ -16,7 +16,7 @@ body:
       description: "Link to parent story/task issue (format: #123)"
       placeholder: "#50"
     validations:
-      required: false
+      required: true
 
   - type: dropdown
     id: task-type
