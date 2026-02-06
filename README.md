@@ -23,6 +23,9 @@ on:
 jobs:
   ci:
     uses: jcttech/.github/.github/workflows/rust-pipeline.yml@v1
+    permissions:
+      contents: write   # For releases
+      packages: write   # For Docker
     secrets: inherit
 ```
 
@@ -41,6 +44,9 @@ on:
 jobs:
   ci:
     uses: jcttech/.github/.github/workflows/python-pipeline.yml@v1
+    permissions:
+      contents: read
+      packages: write   # For Docker
     secrets: inherit
 ```
 
@@ -53,7 +59,7 @@ Complete CI/CD for Rust projects: change detection, build, clippy, test, Docker,
 **Inputs:**
 | Input | Type | Default | Description |
 |-------|------|---------|-------------|
-| `code-paths` | string | src/**, Cargo.*, Dockerfile, tests/** | YAML list of glob patterns for code files |
+| `code-paths` | string | src/**, Cargo.*, Dockerfile, tests/** | Newline-separated glob patterns for code files |
 | `rust-version` | string | `stable` | Rust toolchain version |
 | `enable-docker` | boolean | `true` | Build and push Docker image |
 | `enable-release` | boolean | `true` | Create GitHub release on tags |
@@ -66,9 +72,12 @@ jobs:
     with:
       rust-version: '1.93'
       code-paths: |
-        - 'src/**'
-        - 'lib/**'
-        - 'Cargo.*'
+        src/**
+        lib/**
+        Cargo.*
+    permissions:
+      contents: write
+      packages: write
     secrets: inherit
 ```
 
@@ -79,7 +88,7 @@ Complete CI/CD for Python projects: change detection, pytest, ruff, and Docker.
 **Inputs:**
 | Input | Type | Default | Description |
 |-------|------|---------|-------------|
-| `code-paths` | string | src/**, pyproject.toml, requirements*.txt, Dockerfile | YAML list of glob patterns |
+| `code-paths` | string | src/**, pyproject.toml, requirements*.txt, Dockerfile | Newline-separated glob patterns |
 | `python-version` | string | `3.12` | Python version |
 | `enable-docker` | boolean | `true` | Build and push Docker image |
 
@@ -109,6 +118,8 @@ jobs:
     uses: jcttech/.github/.github/workflows/cleanup-docker.yml@v1
     with:
       image-name: my-project
+    permissions:
+      packages: write
     secrets: inherit
 ```
 
@@ -143,6 +154,16 @@ These can be used standalone in custom workflows.
     image-name: 'my-image'  # optional, defaults to repo name
     push: 'true'            # optional
 ```
+
+### Permissions
+
+Reusable workflows require the calling workflow to grant permissions that nested jobs need:
+
+| Workflow | Required Permissions |
+|----------|---------------------|
+| `rust-pipeline.yml` | `contents: write` (releases), `packages: write` (Docker) |
+| `python-pipeline.yml` | `packages: write` (Docker) |
+| `cleanup-docker.yml` | `packages: write` |
 
 ### Features
 

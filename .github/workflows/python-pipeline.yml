@@ -6,11 +6,11 @@ on:
       code-paths:
         type: string
         default: |
-          - 'src/**'
-          - 'pyproject.toml'
-          - 'requirements*.txt'
-          - 'Dockerfile'
-        description: 'YAML list of glob patterns for code files'
+          src/**
+          pyproject.toml
+          requirements*.txt
+          Dockerfile
+        description: 'Newline-separated glob patterns for code files'
       python-version:
         type: string
         default: '3.12'
@@ -26,12 +26,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Build filter config
+        id: build-filter
+        run: |
+          # Convert newline-separated paths to YAML list format
+          PATHS=$(echo "${{ inputs.code-paths }}" | sed '/^$/d' | sed 's/^/      - /')
+          echo "filters<<EOF" >> $GITHUB_OUTPUT
+          echo "code:" >> $GITHUB_OUTPUT
+          echo "$PATHS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
       - uses: dorny/paths-filter@v3
         id: filter
         with:
-          filters: |
-            code:
-              ${{ inputs.code-paths }}
+          filters: ${{ steps.build-filter.outputs.filters }}
 
   test:
     needs: changes
