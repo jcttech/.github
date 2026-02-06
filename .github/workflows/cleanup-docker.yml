@@ -1,0 +1,33 @@
+name: Cleanup Docker Images
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        type: string
+        required: true
+        description: 'Image name to clean up (without registry prefix)'
+      keep-recent:
+        type: number
+        default: 10
+        description: 'Number of recent images to keep'
+      cut-off:
+        type: string
+        default: '2 weeks ago UTC'
+        description: 'Delete images older than this'
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Delete old container images
+        uses: snok/container-retention-policy@v3
+        with:
+          account: ${{ github.repository_owner }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          image-names: ${{ inputs.image-name }}
+          cut-off: ${{ inputs.cut-off }}
+          keep-n-most-recent: ${{ inputs.keep-recent }}
+          skip-tags: latest,1,1.*,2,2.*,3,3.*

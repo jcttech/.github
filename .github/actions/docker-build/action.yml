@@ -1,0 +1,79 @@
+name: 'Docker Build'
+description: 'Build and push Docker image with SHA-based skip'
+
+inputs:
+  registry:
+    description: 'Container registry'
+    required: false
+    default: 'ghcr.io'
+  image-name:
+    description: 'Image name (defaults to repo name)'
+    required: false
+  sha:
+    description: 'Commit SHA for tagging'
+    required: true
+  push:
+    description: 'Push image to registry'
+    required: false
+    default: 'true'
+
+outputs:
+  image-exists:
+    description: 'Whether image already existed'
+    value: ${{ steps.check.outputs.exists }}
+  tags:
+    description: 'Applied tags'
+    value: ${{ steps.meta.outputs.tags }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Check if image exists
+      id: check
+      shell: bash
+      run: |
+        IMAGE="${{ inputs.registry }}/${{ inputs.image-name || github.repository }}"
+        if docker manifest inspect ${IMAGE}:${{ inputs.sha }} > /dev/null 2>&1; then
+          echo "exists=true" >> $GITHUB_OUTPUT
+        else
+          echo "exists=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Set up Docker Buildx
+      if: steps.check.outputs.exists != 'true'
+      uses: docker/setup-buildx-action@v3
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ inputs.registry }}/${{ inputs.image-name || github.repository }}
+        tags: |
+          type=sha,prefix=
+          type=raw,value=latest,enable={{is_default_branch}}
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=semver,pattern={{major}},enable=${{ !startsWith(github.ref, 'refs/tags/v0.') }}
+
+    - name: Build and push
+      if: steps.check.outputs.exists != 'true' && inputs.push == 'true'
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Retag existing image
+      if: steps.check.outputs.exists == 'true' && inputs.push == 'true'
+      shell: bash
+      run: |
+        SOURCE="${{ inputs.registry }}/${{ inputs.image-name || github.repository }}:${{ inputs.sha }}"
+        TAGS="${{ steps.meta.outputs.tags }}"
+        TAG_ARGS=""
+        for tag in $TAGS; do
+          TAG_ARGS="${TAG_ARGS} -t ${tag}"
+        done
+        docker buildx imagetools create ${TAG_ARGS} ${SOURCE}
