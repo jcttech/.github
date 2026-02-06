@@ -39,7 +39,7 @@ jobs:
 
   build:
     needs: changes
-    if: |
+    if: >-
       startsWith(github.ref, 'refs/tags/v') ||
       github.event_name == 'pull_request' ||
       needs.changes.outputs.code == 'true'
@@ -54,7 +54,7 @@ jobs:
         run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
       - name: Setup Rust
-        uses: jcttech/.github/.github/actions/rust-setup@main
+        uses: jcttech/.github/.github/actions/rust-setup@v1
         with:
           rust-version: ${{ inputs.rust-version }}
 
@@ -76,11 +76,10 @@ jobs:
 
   docker:
     needs: [changes, build]
-    if: |
-      inputs.enable-docker && (
-        startsWith(github.ref, 'refs/tags/v') ||
-        (github.ref == 'refs/heads/main' && needs.changes.outputs.code == 'true')
-      )
+    if: >-
+      inputs.enable-docker &&
+      (startsWith(github.ref, 'refs/tags/v') ||
+      (github.ref == 'refs/heads/main' && needs.changes.outputs.code == 'true'))
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -96,7 +95,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push
-        uses: jcttech/.github/.github/actions/docker-build@main
+        uses: jcttech/.github/.github/actions/docker-build@v1
         with:
           sha: ${{ needs.build.outputs.sha_short }}
 
