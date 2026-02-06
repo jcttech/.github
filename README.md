@@ -45,7 +45,7 @@ jobs:
   ci:
     uses: jcttech/.github/.github/workflows/python-pipeline.yml@v1
     permissions:
-      contents: read
+      contents: write   # For releases
       packages: write   # For Docker
     secrets: inherit
 ```
@@ -83,7 +83,7 @@ jobs:
 
 #### `python-pipeline.yml`
 
-Complete CI/CD for Python projects: change detection, pytest, ruff, and Docker.
+Complete CI/CD for Python projects: change detection, pytest, ruff, Docker, and releases.
 
 **Inputs:**
 | Input | Type | Default | Description |
@@ -91,6 +91,7 @@ Complete CI/CD for Python projects: change detection, pytest, ruff, and Docker.
 | `code-paths` | string | src/**, pyproject.toml, requirements*.txt, Dockerfile | Newline-separated glob patterns |
 | `python-version` | string | `3.12` | Python version |
 | `enable-docker` | boolean | `true` | Build and push Docker image |
+| `enable-release` | boolean | `true` | Create GitHub release on tags |
 
 #### `cleanup-docker.yml`
 
@@ -162,7 +163,7 @@ Reusable workflows require the calling workflow to grant permissions that nested
 | Workflow | Required Permissions |
 |----------|---------------------|
 | `rust-pipeline.yml` | `contents: write` (releases), `packages: write` (Docker) |
-| `python-pipeline.yml` | `packages: write` (Docker) |
+| `python-pipeline.yml` | `contents: write` (releases), `packages: write` (Docker) |
 | `cleanup-docker.yml` | `packages: write` |
 
 ### Features
