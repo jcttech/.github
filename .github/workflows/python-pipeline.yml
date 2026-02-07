@@ -20,6 +20,18 @@ on:
       enable-release:
         type: boolean
         default: true
+      tag-prefix:
+        type: string
+        default: ''
+        description: 'Tag prefix for multi-binary workspaces (e.g. "my-app/")'
+      image-name:
+        type: string
+        default: ''
+        description: 'Docker image name (defaults to github.repository)'
+      dockerfile:
+        type: string
+        default: 'Dockerfile'
+        description: 'Path to Dockerfile'
 
 jobs:
   changes:
@@ -47,7 +59,7 @@ jobs:
   test:
     needs: changes
     if: >-
-      startsWith(github.ref, 'refs/tags/v') ||
+      startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix)) ||
       github.event_name == 'pull_request' ||
       needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
@@ -72,11 +84,11 @@ jobs:
         run: uv run ruff check .
 
       - name: Build package
-        if: inputs.enable-release && startsWith(github.ref, 'refs/tags/v')
+        if: inputs.enable-release && startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix))
         run: uv build
 
       - name: Upload artifacts
-        if: inputs.enable-release && startsWith(github.ref, 'refs/tags/v')
+        if: inputs.enable-release && startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix))
         uses: actions/upload-artifact@v4
         with:
           name: dist
@@ -86,7 +98,7 @@ jobs:
     needs: [changes, test]
     if: >-
       inputs.enable-docker &&
-      (startsWith(github.ref, 'refs/tags/v') ||
+      (startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix)) ||
       (github.ref == 'refs/heads/main' && needs.changes.outputs.code == 'true'))
     runs-on: ubuntu-latest
     permissions:
@@ -106,10 +118,13 @@ jobs:
         uses: jcttech/.github/.github/actions/docker-build@v1
         with:
           sha: ${{ needs.test.outputs.sha_short }}
+          image-name: ${{ inputs.image-name }}
+          dockerfile: ${{ inputs.dockerfile }}
+          tag-prefix: ${{ inputs.tag-prefix }}
 
   release:
     needs: [test, docker]
-    if: inputs.enable-release && startsWith(github.ref, 'refs/tags/v')
+    if: inputs.enable-release && startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix))
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -16,6 +16,14 @@ inputs:
     description: 'Push image to registry'
     required: false
     default: 'true'
+  tag-prefix:
+    description: 'Tag prefix to strip for semver extraction (e.g. "session-manager/")'
+    required: false
+    default: ''
+  dockerfile:
+    description: 'Path to Dockerfile'
+    required: false
+    default: 'Dockerfile'
 
 outputs:
   image-exists:
@@ -43,6 +51,15 @@ runs:
       if: steps.check.outputs.exists != 'true'
       uses: docker/setup-buildx-action@v3
 
+    - name: Compute clean version
+      if: startsWith(github.ref, 'refs/tags/')
+      id: clean-ref
+      shell: bash
+      run: |
+        REF_NAME="${GITHUB_REF_NAME}"
+        PREFIX="${{ inputs.tag-prefix }}"
+        echo "version=${REF_NAME#$PREFIX}" >> $GITHUB_OUTPUT
+
     - name: Extract metadata
       id: meta
       uses: docker/metadata-action@v5
@@ -51,15 +68,16 @@ runs:
         tags: |
           type=sha,prefix=
           type=raw,value=latest,enable={{is_default_branch}}
-          type=semver,pattern={{version}}
-          type=semver,pattern={{major}}.{{minor}}
-          type=semver,pattern={{major}},enable=${{ !startsWith(github.ref, 'refs/tags/v0.') }}
+          type=semver,pattern={{version}},value=${{ steps.clean-ref.outputs.version || '' }}
+          type=semver,pattern={{major}}.{{minor}},value=${{ steps.clean-ref.outputs.version || '' }}
+          type=semver,pattern={{major}},value=${{ steps.clean-ref.outputs.version || '' }},enable=${{ !startsWith(steps.clean-ref.outputs.version || 'v1', 'v0.') }}
 
     - name: Build and push
       if: steps.check.outputs.exists != 'true' && inputs.push == 'true'
       uses: docker/build-push-action@v6
       with:
         context: .
+        file: ${{ inputs.dockerfile }}
         push: true
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
