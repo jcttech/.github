@@ -21,6 +21,15 @@ on:
       enable-release:
         type: boolean
         default: true
+      enable-database-tests:
+        type: boolean
+        default: false
+      database-test-command:
+        type: string
+        default: 'cargo test --test database_tests -- --nocapture'
+      postgres-image:
+        type: string
+        default: 'postgres:18'
 
 jobs:
   changes:
@@ -82,8 +91,21 @@ jobs:
           path: target/release/*
           if-no-files-found: ignore
 
+  database-tests:
+    needs: changes
+    if: >-
+      inputs.enable-database-tests &&
+      (startsWith(github.ref, 'refs/tags/v') ||
+      github.event_name == 'pull_request' ||
+      needs.changes.outputs.code == 'true')
+    uses: jcttech/.github/.github/workflows/rust-database-tests.yml@v1
+    with:
+      test-command: ${{ inputs.database-test-command }}
+      postgres-image: ${{ inputs.postgres-image }}
+      rust-version: ${{ inputs.rust-version }}
+
   docker:
-    needs: [changes, build]
+    needs: [changes, build, database-tests]
     if: >-
       inputs.enable-docker &&
       (startsWith(github.ref, 'refs/tags/v') ||
@@ -108,7 +130,7 @@ jobs:
           sha: ${{ needs.build.outputs.sha_short }}
 
   release:
-    needs: [build, docker]
+    needs: [build, docker, database-tests]
     if: inputs.enable-release && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:

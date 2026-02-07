@@ -1,0 +1,45 @@
+name: Rust Database Tests
+
+on:
+  workflow_call:
+    inputs:
+      test-command:
+        type: string
+        default: 'cargo test --test database_tests -- --nocapture'
+      postgres-image:
+        type: string
+        default: 'postgres:18'
+      rust-version:
+        type: string
+        default: 'stable'
+
+jobs:
+  database-tests:
+    name: Database Tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: ${{ inputs.postgres-image }}
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: jcttech/.github/.github/actions/rust-setup@v1
+        with:
+          rust-version: ${{ inputs.rust-version }}
+
+      - name: Run database tests
+        env:
+          DATABASE_URL: postgres://test:test@localhost:5432/test_db
+        run: ${{ inputs.test-command }}
