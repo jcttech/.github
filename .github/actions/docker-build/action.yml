@@ -36,11 +36,21 @@ outputs:
 runs:
   using: 'composite'
   steps:
+    - name: Compute image reference
+      id: image-ref
+      shell: bash
+      run: |
+        if [ -n "${{ inputs.image-name }}" ]; then
+          echo "name=${{ github.repository_owner }}/${{ inputs.image-name }}" >> $GITHUB_OUTPUT
+        else
+          echo "name=${{ github.repository }}" >> $GITHUB_OUTPUT
+        fi
+
     - name: Check if image exists
       id: check
       shell: bash
       run: |
-        IMAGE="${{ inputs.registry }}/${{ inputs.image-name || github.repository }}"
+        IMAGE="${{ inputs.registry }}/${{ steps.image-ref.outputs.name }}"
         if docker manifest inspect ${IMAGE}:${{ inputs.sha }} > /dev/null 2>&1; then
           echo "exists=true" >> $GITHUB_OUTPUT
         else
@@ -64,7 +74,7 @@ runs:
       id: meta
       uses: docker/metadata-action@v5
       with:
-        images: ${{ inputs.registry }}/${{ inputs.image-name || github.repository }}
+        images: ${{ inputs.registry }}/${{ steps.image-ref.outputs.name }}
         tags: |
           type=sha,prefix=
           type=raw,value=latest,enable={{is_default_branch}}
@@ -88,7 +98,7 @@ runs:
       if: steps.check.outputs.exists == 'true' && inputs.push == 'true'
       shell: bash
       run: |
-        SOURCE="${{ inputs.registry }}/${{ inputs.image-name || github.repository }}:${{ inputs.sha }}"
+        SOURCE="${{ inputs.registry }}/${{ steps.image-ref.outputs.name }}:${{ inputs.sha }}"
         TAGS="${{ steps.meta.outputs.tags }}"
         TAG_ARGS=""
         for tag in $TAGS; do
