@@ -42,6 +42,14 @@ on:
         type: string
         default: 'Dockerfile'
         description: 'Path to Dockerfile'
+      binary-name:
+        type: string
+        default: ''
+        description: 'Binary name to extract from build artifact for CI Docker image'
+      ci-dockerfile:
+        type: string
+        default: ''
+        description: 'CI-specific Dockerfile that copies pre-built binary (skips compilation)'
 
 jobs:
   changes:
@@ -129,6 +137,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Download binary artifact
+        if: inputs.binary-name != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: binary
+          path: ./artifact
+
+      - name: Prepare binary
+        if: inputs.binary-name != ''
+        run: chmod +x ./artifact/${{ inputs.binary-name }}
+
       - name: Login to registry
         uses: docker/login-action@v3
         with:
@@ -141,7 +160,7 @@ jobs:
         with:
           sha: ${{ needs.build.outputs.sha_short }}
           image-name: ${{ inputs.image-name }}
-          dockerfile: ${{ inputs.dockerfile }}
+          dockerfile: ${{ inputs.ci-dockerfile || inputs.dockerfile }}
           tag-prefix: ${{ inputs.tag-prefix }}
 
   release:

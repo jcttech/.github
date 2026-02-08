@@ -10,6 +10,10 @@ inputs:
     description: 'Additional components (comma-separated)'
     required: false
     default: 'clippy'
+  enable-sccache:
+    description: 'Enable sccache for compilation caching'
+    required: false
+    default: 'true'
 
 outputs:
   cache-hit:
@@ -25,6 +29,17 @@ runs:
         toolchain: ${{ inputs.rust-version }}
         components: ${{ inputs.components }}
 
+    - name: Setup sccache
+      if: inputs.enable-sccache == 'true'
+      uses: mozilla-actions/sccache-action@v0.0.9
+
+    - name: Configure sccache environment
+      if: inputs.enable-sccache == 'true'
+      shell: bash
+      run: |
+        echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
+        echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+
     - name: Cache cargo
       id: cache
       uses: actions/cache@v4
@@ -34,6 +49,5 @@ runs:
           ~/.cargo/registry/index/
           ~/.cargo/registry/cache/
           ~/.cargo/git/db/
-          target/
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: ${{ runner.os }}-cargo-
