@@ -99,12 +99,20 @@ jobs:
         run: cargo build --release
 
       - name: Clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --release -- -D warnings
 
       - name: Test
         run: cargo test --all-features
 
       - name: Upload binary
+        if: inputs.binary-name != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary
+          path: target/release/${{ inputs.binary-name }}
+
+      - name: Upload binary (all)
+        if: inputs.binary-name == ''
         uses: actions/upload-artifact@v4
         with:
           name: binary
