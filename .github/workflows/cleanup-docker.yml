@@ -13,8 +13,8 @@ on:
         description: 'Number of recent images to keep'
       cut-off:
         type: string
-        default: '2 weeks ago UTC'
-        description: 'Delete images older than this'
+        default: '2w'
+        description: 'Delete images older than this (humantime format, e.g. 2w, 30d)'
 
 jobs:
   cleanup:
