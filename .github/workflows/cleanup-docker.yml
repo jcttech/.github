@@ -9,7 +9,7 @@ on:
         description: 'Image name to clean up (without registry prefix)'
       keep-recent:
         type: number
-        default: 10
+        default: 3
         description: 'Number of recent images to keep'
       cut-off:
         type: string
