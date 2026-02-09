@@ -23,7 +23,7 @@ jobs:
       packages: write
     steps:
       - name: Delete old container images
-        uses: snok/container-retention-policy@v3
+        uses: snok/container-retention-policy@v3.0.1
         with:
           account: ${{ github.repository_owner }}
           token: ${{ secrets.GITHUB_TOKEN }}
