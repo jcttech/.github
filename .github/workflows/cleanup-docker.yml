@@ -30,4 +30,4 @@ jobs:
           image-names: ${{ inputs.image-name }}
           cut-off: ${{ inputs.cut-off }}
           keep-n-most-recent: ${{ inputs.keep-recent }}
-          skip-tags: latest,1,1.*,2,2.*,3,3.*
+          tag-selection: both
