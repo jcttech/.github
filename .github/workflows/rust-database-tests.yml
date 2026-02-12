@@ -12,11 +12,15 @@ on:
       rust-version:
         type: string
         default: 'stable'
+      runner:
+        type: string
+        default: 'github-arc-github-arc-runner-set'
+        description: 'Runner label (e.g. "github-arc-github-arc-runner-set" or "ubuntu-latest")'
 
 jobs:
   database-tests:
     name: Database Tests
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     services:
       postgres:
         image: ${{ inputs.postgres-image }}

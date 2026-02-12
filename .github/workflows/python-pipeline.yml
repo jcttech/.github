@@ -32,10 +32,14 @@ on:
         type: string
         default: 'Dockerfile'
         description: 'Path to Dockerfile'
+      runner:
+        type: string
+        default: 'github-arc-github-arc-runner-set'
+        description: 'Runner label (e.g. "github-arc-github-arc-runner-set" or "ubuntu-latest")'
 
 jobs:
   changes:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     outputs:
       code: ${{ steps.filter.outputs.code }}
     steps:
@@ -62,7 +66,7 @@ jobs:
       startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix)) ||
       github.event_name == 'pull_request' ||
       needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     outputs:
       sha_short: ${{ steps.vars.outputs.sha_short }}
     steps:
@@ -100,7 +104,7 @@ jobs:
       inputs.enable-docker &&
       (startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix)) ||
       (github.ref == 'refs/heads/main' && needs.changes.outputs.code == 'true'))
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     permissions:
       contents: read
       packages: write
@@ -125,7 +129,7 @@ jobs:
   release:
     needs: [test, docker]
     if: inputs.enable-release && startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix))
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     permissions:
       contents: write
     steps:

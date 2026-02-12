@@ -15,10 +15,14 @@ on:
         type: string
         default: '2w'
         description: 'Delete images older than this (humantime format, e.g. 2w, 30d)'
+      runner:
+        type: string
+        default: 'github-arc-github-arc-runner-set'
+        description: 'Runner label (e.g. "github-arc-github-arc-runner-set" or "ubuntu-latest")'
 
 jobs:
   cleanup:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     permissions:
       packages: write
     steps:

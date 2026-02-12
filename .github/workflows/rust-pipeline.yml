@@ -50,10 +50,14 @@ on:
         type: string
         default: ''
         description: 'CI-specific Dockerfile that copies pre-built binary (skips compilation)'
+      runner:
+        type: string
+        default: 'github-arc-github-arc-runner-set'
+        description: 'Runner label (e.g. "github-arc-github-arc-runner-set" or "ubuntu-latest")'
 
 jobs:
   changes:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     outputs:
       code: ${{ steps.filter.outputs.code }}
     steps:
@@ -80,7 +84,7 @@ jobs:
       startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix)) ||
       github.event_name == 'pull_request' ||
       needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     outputs:
       sha_short: ${{ steps.vars.outputs.sha_short }}
     steps:
@@ -131,6 +135,7 @@ jobs:
       test-command: ${{ inputs.database-test-command }}
       postgres-image: ${{ inputs.postgres-image }}
       rust-version: ${{ inputs.rust-version }}
+      runner: ${{ inputs.runner }}
 
   docker:
     needs: [changes, build, database-tests]
@@ -138,7 +143,7 @@ jobs:
       inputs.enable-docker &&
       (startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix)) ||
       (github.ref == 'refs/heads/main' && needs.changes.outputs.code == 'true'))
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     permissions:
       contents: read
       packages: write
@@ -174,7 +179,7 @@ jobs:
   release:
     needs: [build, docker, database-tests]
     if: inputs.enable-release && startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix))
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     permissions:
       contents: write
     steps:
