@@ -18,17 +18,16 @@ on:
       runner:
         type: string
         default: 'github-arc-github-arc-runner-set'
-        description: 'Runner label (e.g. "github-arc-github-arc-runner-set" or "ubuntu-latest")'
+        description: 'Runner label for cleanup jobs'
       container-image:
         type: string
-        default: 'ubuntu:22.04'
-        description: 'Container image for job pods (required for ARC Kubernetes mode)'
+        default: 'ghcr.io/jcttech/devcontainer-base:latest'
+        description: 'Container image for job pods (required for ARC K8s mode, empty string for GHA runners)'
 
 jobs:
   cleanup:
     runs-on: ${{ inputs.runner }}
-    container:
-      image: ${{ inputs.container-image }}
+    container: ${{ inputs.container-image || null }}
     permissions:
       packages: write
     steps:

@@ -53,17 +53,16 @@ on:
       runner:
         type: string
         default: 'github-arc-github-arc-runner-set'
-        description: 'Runner label (e.g. "github-arc-github-arc-runner-set" or "ubuntu-latest")'
+        description: 'Runner label for build/test jobs'
       container-image:
         type: string
-        default: 'rust:bookworm'
-        description: 'Container image for job pods (required for ARC Kubernetes mode)'
+        default: 'ghcr.io/jcttech/devcontainer-rust:latest'
+        description: 'Container image for job pods (required for ARC K8s mode, empty string for GHA runners)'
 
 jobs:
   changes:
     runs-on: ${{ inputs.runner }}
-    container:
-      image: ${{ inputs.container-image }}
+    container: ${{ inputs.container-image || null }}
     outputs:
       code: ${{ steps.filter.outputs.code }}
     steps:
@@ -91,8 +90,7 @@ jobs:
       github.event_name == 'pull_request' ||
       needs.changes.outputs.code == 'true'
     runs-on: ${{ inputs.runner }}
-    container:
-      image: ${{ inputs.container-image }}
+    container: ${{ inputs.container-image || null }}
     outputs:
       sha_short: ${{ steps.vars.outputs.sha_short }}
     steps:
@@ -152,8 +150,8 @@ jobs:
       inputs.enable-docker &&
       (startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix)) ||
       (github.ref == 'refs/heads/main' && needs.changes.outputs.code == 'true'))
-    # Docker build/push requires a Docker daemon - use GHA runner (not K8s mode)
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
+    container: ${{ inputs.container-image || null }}
     permissions:
       contents: read
       packages: write
@@ -189,8 +187,8 @@ jobs:
   release:
     needs: [build, docker, database-tests]
     if: inputs.enable-release && startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix))
-    # Release runs alongside docker on GHA
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
+    container: ${{ inputs.container-image || null }}
     permissions:
       contents: write
     steps:
