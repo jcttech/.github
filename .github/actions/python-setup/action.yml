@@ -6,14 +6,23 @@ inputs:
     description: 'Python version'
     required: false
     default: '3.12'
+  shared-cache:
+    description: 'Path to shared cache volume (K8s NFS). Empty to use GH Actions cache.'
+    required: false
+    default: '/cache'
 
 runs:
   using: 'composite'
   steps:
+    - name: Configure shared uv cache
+      if: inputs.shared-cache != ''
+      shell: bash
+      run: echo "UV_CACHE_DIR=${{ inputs.shared-cache }}/uv" >> $GITHUB_ENV
+
     - name: Install uv
       uses: astral-sh/setup-uv@v5
       with:
-        enable-cache: true
+        enable-cache: ${{ inputs.shared-cache == '' }}
 
     - name: Set up Python
       shell: bash
