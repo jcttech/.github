@@ -1,5 +1,5 @@
 name: 'Docker Build'
-description: 'Build and push Docker image with SHA-based skip'
+description: 'Build and push Docker image with SHA-based skip (supports Docker and Kaniko)'
 
 inputs:
   registry:
@@ -46,19 +46,44 @@ runs:
           echo "name=${{ github.repository }}" >> $GITHUB_OUTPUT
         fi
 
+    - name: Detect builder
+      id: detect
+      shell: bash
+      run: |
+        if [ -x /kaniko/executor ]; then
+          echo "builder=kaniko" >> $GITHUB_OUTPUT
+        else
+          echo "builder=docker" >> $GITHUB_OUTPUT
+        fi
+
     - name: Check if image exists
       id: check
       shell: bash
       run: |
         IMAGE="${{ inputs.registry }}/${{ steps.image-ref.outputs.name }}"
-        if docker manifest inspect ${IMAGE}:${{ inputs.sha }} > /dev/null 2>&1; then
-          echo "exists=true" >> $GITHUB_OUTPUT
+        TAG="${{ inputs.sha }}"
+        if [ "${{ steps.detect.outputs.builder }}" = "kaniko" ]; then
+          # Use registry API to check (works without docker CLI)
+          TOKEN=$(cat ~/.docker/config.json 2>/dev/null | grep -o '"auth":"[^"]*"' | head -1 | cut -d'"' -f4)
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $TOKEN" \
+            "https://${{ inputs.registry }}/v2/${{ steps.image-ref.outputs.name }}/manifests/${TAG}" \
+            -H "Accept: application/vnd.docker.distribution.manifest.v2+json")
+          if [ "$STATUS" = "200" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
         else
-          echo "exists=false" >> $GITHUB_OUTPUT
+          if docker manifest inspect ${IMAGE}:${TAG} > /dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
         fi
 
     - name: Set up Docker Buildx
-      if: steps.check.outputs.exists != 'true'
+      if: steps.check.outputs.exists != 'true' && steps.detect.outputs.builder == 'docker'
       uses: docker/setup-buildx-action@v3
 
     - name: Compute clean version
@@ -82,8 +107,8 @@ runs:
           type=semver,pattern={{major}}.{{minor}},value=${{ steps.clean-ref.outputs.version || '' }}
           type=semver,pattern={{major}},value=${{ steps.clean-ref.outputs.version || '' }},enable=${{ !startsWith(steps.clean-ref.outputs.version || 'v1', 'v0.') }}
 
-    - name: Build and push
-      if: steps.check.outputs.exists != 'true' && inputs.push == 'true'
+    - name: Build and push (Docker)
+      if: steps.check.outputs.exists != 'true' && inputs.push == 'true' && steps.detect.outputs.builder == 'docker'
       uses: docker/build-push-action@v6
       with:
         context: .
@@ -94,8 +119,27 @@ runs:
         cache-from: type=gha
         cache-to: type=gha,mode=max
 
-    - name: Retag existing image
-      if: steps.check.outputs.exists == 'true' && inputs.push == 'true'
+    - name: Build and push (Kaniko)
+      if: steps.check.outputs.exists != 'true' && inputs.push == 'true' && steps.detect.outputs.builder == 'kaniko'
+      shell: bash
+      run: |
+        # Configure kaniko auth from docker login credentials
+        mkdir -p /kaniko/.docker
+        cp ~/.docker/config.json /kaniko/.docker/config.json 2>/dev/null || true
+
+        # Build --destination flags from metadata tags
+        DESTINATIONS=""
+        while IFS= read -r tag; do
+          [ -n "$tag" ] && DESTINATIONS="$DESTINATIONS --destination=$tag"
+        done <<< "${{ steps.meta.outputs.tags }}"
+
+        /kaniko/executor \
+          --context=$GITHUB_WORKSPACE \
+          --dockerfile=${{ inputs.dockerfile }} \
+          $DESTINATIONS
+
+    - name: Retag existing image (Docker)
+      if: steps.check.outputs.exists == 'true' && inputs.push == 'true' && steps.detect.outputs.builder == 'docker'
       shell: bash
       run: |
         SOURCE="${{ inputs.registry }}/${{ steps.image-ref.outputs.name }}:${{ inputs.sha }}"
@@ -105,3 +149,10 @@ runs:
           TAG_ARGS="${TAG_ARGS} -t ${tag}"
         done
         docker buildx imagetools create ${TAG_ARGS} ${SOURCE}
+
+    - name: Retag existing image (Kaniko)
+      if: steps.check.outputs.exists == 'true' && inputs.push == 'true' && steps.detect.outputs.builder == 'kaniko'
+      shell: bash
+      run: |
+        echo "Image ${{ inputs.sha }} already exists, skipping rebuild"
+        echo "Note: Kaniko does not support retagging without rebuild"
