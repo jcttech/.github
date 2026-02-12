@@ -68,6 +68,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Mark workspace safe
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: Build filter config
         id: build-filter
         run: |
@@ -95,6 +98,9 @@ jobs:
       sha_short: ${{ steps.vars.outputs.sha_short }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Mark workspace safe
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Set outputs
         id: vars
@@ -158,6 +164,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Mark workspace safe
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: Download binary artifact
         if: inputs.binary-name != ''
         uses: actions/download-artifact@v4
@@ -193,6 +202,9 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+
+      - name: Mark workspace safe
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Download binary
         uses: actions/download-artifact@v4
