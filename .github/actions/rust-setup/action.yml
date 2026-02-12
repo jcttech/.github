@@ -37,7 +37,11 @@ runs:
       if: inputs.enable-sccache == 'true'
       shell: bash
       run: |
-        echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
+        # Use local SCCACHE_DIR if already configured (e.g. self-hosted runner),
+        # otherwise fall back to GitHub Actions cache backend
+        if [ -z "$SCCACHE_DIR" ]; then
+          echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
+        fi
         echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
 
     - name: Cache cargo
