@@ -33,14 +33,6 @@ runs:
         toolchain: ${{ inputs.rust-version }}
         components: ${{ inputs.components }}
 
-    - name: Configure shared cargo cache
-      if: inputs.shared-cache != '' && hashFiles('**/Cargo.lock') != ''
-      shell: bash
-      run: |
-        CACHE_DIR="${{ inputs.shared-cache }}/cargo/${{ hashFiles('**/Cargo.lock') }}"
-        mkdir -p "$CACHE_DIR/registry" "$CACHE_DIR/git"
-        echo "CARGO_HOME=$CACHE_DIR" >> $GITHUB_ENV
-
     - name: Setup sccache
       if: inputs.enable-sccache == 'true'
       uses: mozilla-actions/sccache-action@v0.0.9
@@ -56,7 +48,7 @@ runs:
         fi
         echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
 
-    - name: Cache cargo (GHA runners)
+    - name: Cache cargo (GHA runners only)
       if: inputs.shared-cache == ''
       id: cache
       uses: actions/cache@v4
