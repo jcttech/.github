@@ -19,10 +19,16 @@ on:
         type: string
         default: 'github-arc-github-arc-runner-set'
         description: 'Runner label (e.g. "github-arc-github-arc-runner-set" or "ubuntu-latest")'
+      container-image:
+        type: string
+        default: 'ubuntu:22.04'
+        description: 'Container image for job pods (required for ARC Kubernetes mode)'
 
 jobs:
   cleanup:
     runs-on: ${{ inputs.runner }}
+    container:
+      image: ${{ inputs.container-image }}
     permissions:
       packages: write
     steps:

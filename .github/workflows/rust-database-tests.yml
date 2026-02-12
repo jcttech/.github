@@ -16,11 +16,17 @@ on:
         type: string
         default: 'github-arc-github-arc-runner-set'
         description: 'Runner label (e.g. "github-arc-github-arc-runner-set" or "ubuntu-latest")'
+      container-image:
+        type: string
+        default: 'rust:bookworm'
+        description: 'Container image for job pods (required for ARC Kubernetes mode)'
 
 jobs:
   database-tests:
     name: Database Tests
     runs-on: ${{ inputs.runner }}
+    container:
+      image: ${{ inputs.container-image }}
     services:
       postgres:
         image: ${{ inputs.postgres-image }}
