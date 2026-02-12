@@ -120,6 +120,20 @@ jobs:
       - name: Test
         run: cargo test --all-features
 
+      - name: Stage binary to shared cache
+        if: inputs.binary-name != '' && inputs.container-image != '' && (inputs.enable-docker || inputs.enable-release)
+        run: |
+          mkdir -p /cache/workflow/${{ github.run_id }}
+          cp target/release/${{ inputs.binary-name }} /cache/workflow/${{ github.run_id }}/
+          chmod +x /cache/workflow/${{ github.run_id }}/${{ inputs.binary-name }}
+
+      - name: Upload binary artifact
+        if: inputs.binary-name != '' && inputs.container-image == '' && (inputs.enable-docker || inputs.enable-release)
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary
+          path: target/release/${{ inputs.binary-name }}
+
   database-tests:
     needs: changes
     if: >-
@@ -152,12 +166,22 @@ jobs:
       - name: Mark workspace safe
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: Prepare binary
-        if: inputs.binary-name != ''
+      - name: Download binary artifact
+        if: inputs.binary-name != '' && inputs.container-image == ''
+        uses: actions/download-artifact@v4
+        with:
+          name: binary
+          path: ./artifact
+
+      - name: Retrieve binary from shared cache
+        if: inputs.binary-name != '' && inputs.container-image != ''
         run: |
           mkdir -p ./artifact
-          cp target/release/${{ inputs.binary-name }} ./artifact/
-          chmod +x ./artifact/${{ inputs.binary-name }}
+          cp /cache/workflow/${{ github.run_id }}/${{ inputs.binary-name }} ./artifact/
+
+      - name: Prepare binary
+        if: inputs.binary-name != ''
+        run: chmod +x ./artifact/${{ inputs.binary-name }}
 
       - name: Login to registry
         uses: docker/login-action@v3
@@ -187,15 +211,25 @@ jobs:
       - name: Mark workspace safe
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: Prepare release assets
+      - name: Download binary artifact
+        if: inputs.binary-name != '' && inputs.container-image == ''
+        uses: actions/download-artifact@v4
+        with:
+          name: binary
+          path: ./artifacts
+
+      - name: Retrieve binary from shared cache
+        if: inputs.binary-name != '' && inputs.container-image != ''
         run: |
           mkdir -p ./artifacts
-          if [ -n "${{ inputs.binary-name }}" ]; then
-            cp target/release/${{ inputs.binary-name }} ./artifacts/
-          fi
+          cp /cache/workflow/${{ github.run_id }}/${{ inputs.binary-name }} ./artifacts/
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           files: ./artifacts/*
+
+      - name: Cleanup shared cache
+        if: always() && inputs.container-image != ''
+        run: rm -rf /cache/workflow/${{ github.run_id }}

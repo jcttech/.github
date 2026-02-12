@@ -103,7 +103,18 @@ jobs:
         if: inputs.enable-release && startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix))
         run: uv build
 
-      # dist/ available to release job via shared work volume
+      - name: Stage dist to shared cache
+        if: inputs.enable-release && inputs.container-image != '' && startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix))
+        run: |
+          mkdir -p /cache/workflow/${{ github.run_id }}/dist
+          cp dist/* /cache/workflow/${{ github.run_id }}/dist/
+
+      - name: Upload dist artifact
+        if: inputs.enable-release && inputs.container-image == '' && startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix))
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
 
   docker:
     needs: [changes, test]
@@ -150,8 +161,25 @@ jobs:
       - name: Mark workspace safe
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
+      - name: Download dist artifact
+        if: inputs.container-image == ''
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: ./dist
+
+      - name: Retrieve dist from shared cache
+        if: inputs.container-image != ''
+        run: |
+          mkdir -p ./dist
+          cp /cache/workflow/${{ github.run_id }}/dist/* ./dist/
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           files: ./dist/*
+
+      - name: Cleanup shared cache
+        if: always() && inputs.container-image != ''
+        run: rm -rf /cache/workflow/${{ github.run_id }}
