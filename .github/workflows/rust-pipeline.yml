@@ -121,14 +121,14 @@ jobs:
         run: cargo test --all-features
 
       - name: Upload binary
-        if: inputs.binary-name != ''
+        if: inputs.binary-name != '' && (inputs.enable-docker || inputs.enable-release)
         uses: actions/upload-artifact@v4
         with:
           name: binary
           path: target/release/${{ inputs.binary-name }}
 
       - name: Upload binary (all)
-        if: inputs.binary-name == ''
+        if: inputs.binary-name == '' && (inputs.enable-docker || inputs.enable-release)
         uses: actions/upload-artifact@v4
         with:
           name: binary
