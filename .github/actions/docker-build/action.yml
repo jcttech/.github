@@ -1,5 +1,5 @@
 name: 'Docker Build'
-description: 'Build and push Docker image with SHA-based skip (supports Docker and Kaniko)'
+description: 'Build and push Docker image with SHA-based skip (supports Docker and Podman)'
 
 inputs:
   registry:
@@ -50,10 +50,13 @@ runs:
       id: detect
       shell: bash
       run: |
-        if [ -x /kaniko/executor ]; then
-          echo "builder=kaniko" >> $GITHUB_OUTPUT
-        else
+        if command -v podman &>/dev/null; then
+          echo "builder=podman" >> $GITHUB_OUTPUT
+        elif command -v docker &>/dev/null; then
           echo "builder=docker" >> $GITHUB_OUTPUT
+        else
+          echo "::error::No container builder found (need docker or podman)"
+          exit 1
         fi
 
     - name: Check if image exists
@@ -62,24 +65,11 @@ runs:
       run: |
         IMAGE="${{ inputs.registry }}/${{ steps.image-ref.outputs.name }}"
         TAG="${{ inputs.sha }}"
-        if [ "${{ steps.detect.outputs.builder }}" = "kaniko" ]; then
-          # Use registry API to check (works without docker CLI)
-          TOKEN=$(cat ~/.docker/config.json 2>/dev/null | grep -o '"auth":"[^"]*"' | head -1 | cut -d'"' -f4)
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "Authorization: Bearer $TOKEN" \
-            "https://${{ inputs.registry }}/v2/${{ steps.image-ref.outputs.name }}/manifests/${TAG}" \
-            -H "Accept: application/vnd.docker.distribution.manifest.v2+json")
-          if [ "$STATUS" = "200" ]; then
-            echo "exists=true" >> $GITHUB_OUTPUT
-          else
-            echo "exists=false" >> $GITHUB_OUTPUT
-          fi
+        BUILDER="${{ steps.detect.outputs.builder }}"
+        if $BUILDER manifest inspect ${IMAGE}:${TAG} > /dev/null 2>&1; then
+          echo "exists=true" >> $GITHUB_OUTPUT
         else
-          if docker manifest inspect ${IMAGE}:${TAG} > /dev/null 2>&1; then
-            echo "exists=true" >> $GITHUB_OUTPUT
-          else
-            echo "exists=false" >> $GITHUB_OUTPUT
-          fi
+          echo "exists=false" >> $GITHUB_OUTPUT
         fi
 
     - name: Set up Docker Buildx
@@ -119,31 +109,36 @@ runs:
         cache-from: type=gha
         cache-to: type=gha,mode=max
 
-    - name: Build and push (Kaniko)
-      if: steps.check.outputs.exists != 'true' && inputs.push == 'true' && steps.detect.outputs.builder == 'kaniko'
+    - name: Build and push (Podman)
+      if: steps.check.outputs.exists != 'true' && inputs.push == 'true' && steps.detect.outputs.builder == 'podman'
       shell: bash
       env:
         META_TAGS: ${{ steps.meta.outputs.tags }}
+        META_LABELS: ${{ steps.meta.outputs.labels }}
       run: |
-        # Use a writable temp dir for kaniko (non-root container)
-        KANIKO_DIR=$(mktemp -d)
-        mkdir -p "$KANIKO_DIR/.docker"
-        cp ~/.docker/config.json "$KANIKO_DIR/.docker/config.json" 2>/dev/null || true
-
-        # Build --destination flags from metadata tags
-        DESTINATIONS=()
+        # Build tag flags
+        TAG_ARGS=()
         while IFS= read -r tag; do
-          [ -n "$tag" ] && DESTINATIONS+=("--destination=$tag")
+          [ -n "$tag" ] && TAG_ARGS+=("-t" "$tag")
         done <<< "$META_TAGS"
 
-        echo "Building with ${#DESTINATIONS[@]} destination(s):"
-        printf '  %s\n' "${DESTINATIONS[@]}"
+        # Build label flags
+        LABEL_ARGS=()
+        while IFS= read -r label; do
+          [ -n "$label" ] && LABEL_ARGS+=("--label" "$label")
+        done <<< "$META_LABELS"
 
-        /kaniko/executor \
-          --context="$GITHUB_WORKSPACE" \
-          --dockerfile="${{ inputs.dockerfile }}" \
-          --kaniko-dir="$KANIKO_DIR" \
-          "${DESTINATIONS[@]}"
+        echo "Building with ${#TAG_ARGS[@]/2} tag(s)"
+        podman build \
+          --file "${{ inputs.dockerfile }}" \
+          "${TAG_ARGS[@]}" \
+          "${LABEL_ARGS[@]}" \
+          .
+
+        # Push each tag
+        while IFS= read -r tag; do
+          [ -n "$tag" ] && podman push "$tag"
+        done <<< "$META_TAGS"
 
     - name: Retag existing image (Docker)
       if: steps.check.outputs.exists == 'true' && inputs.push == 'true' && steps.detect.outputs.builder == 'docker'
@@ -157,9 +152,17 @@ runs:
         done
         docker buildx imagetools create ${TAG_ARGS} ${SOURCE}
 
-    - name: Retag existing image (Kaniko)
-      if: steps.check.outputs.exists == 'true' && inputs.push == 'true' && steps.detect.outputs.builder == 'kaniko'
+    - name: Retag existing image (Podman)
+      if: steps.check.outputs.exists == 'true' && inputs.push == 'true' && steps.detect.outputs.builder == 'podman'
       shell: bash
+      env:
+        META_TAGS: ${{ steps.meta.outputs.tags }}
       run: |
-        echo "Image ${{ inputs.sha }} already exists, skipping rebuild"
-        echo "Note: Kaniko does not support retagging without rebuild"
+        SOURCE="${{ inputs.registry }}/${{ steps.image-ref.outputs.name }}:${{ inputs.sha }}"
+        podman pull "$SOURCE"
+        while IFS= read -r tag; do
+          if [ -n "$tag" ] && [ "$tag" != "$SOURCE" ]; then
+            podman tag "$SOURCE" "$tag"
+            podman push "$tag"
+          fi
+        done <<< "$META_TAGS"
