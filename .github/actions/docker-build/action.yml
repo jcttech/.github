@@ -123,9 +123,10 @@ runs:
       if: steps.check.outputs.exists != 'true' && inputs.push == 'true' && steps.detect.outputs.builder == 'kaniko'
       shell: bash
       run: |
-        # Configure kaniko auth from docker login credentials
-        mkdir -p /kaniko/.docker
-        cp ~/.docker/config.json /kaniko/.docker/config.json 2>/dev/null || true
+        # Use a writable temp dir for kaniko (non-root container)
+        KANIKO_DIR=$(mktemp -d)
+        mkdir -p "$KANIKO_DIR/.docker"
+        cp ~/.docker/config.json "$KANIKO_DIR/.docker/config.json" 2>/dev/null || true
 
         # Build --destination flags from metadata tags
         DESTINATIONS=""
@@ -136,6 +137,7 @@ runs:
         /kaniko/executor \
           --context=$GITHUB_WORKSPACE \
           --dockerfile=${{ inputs.dockerfile }} \
+          --kaniko-dir="$KANIKO_DIR" \
           $DESTINATIONS
 
     - name: Retag existing image (Docker)
