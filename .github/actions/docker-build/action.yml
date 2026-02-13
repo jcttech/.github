@@ -122,6 +122,8 @@ runs:
     - name: Build and push (Kaniko)
       if: steps.check.outputs.exists != 'true' && inputs.push == 'true' && steps.detect.outputs.builder == 'kaniko'
       shell: bash
+      env:
+        META_TAGS: ${{ steps.meta.outputs.tags }}
       run: |
         # Use a writable temp dir for kaniko (non-root container)
         KANIKO_DIR=$(mktemp -d)
@@ -129,16 +131,19 @@ runs:
         cp ~/.docker/config.json "$KANIKO_DIR/.docker/config.json" 2>/dev/null || true
 
         # Build --destination flags from metadata tags
-        DESTINATIONS=""
+        DESTINATIONS=()
         while IFS= read -r tag; do
-          [ -n "$tag" ] && DESTINATIONS="$DESTINATIONS --destination=$tag"
-        done <<< "${{ steps.meta.outputs.tags }}"
+          [ -n "$tag" ] && DESTINATIONS+=("--destination=$tag")
+        done <<< "$META_TAGS"
+
+        echo "Building with ${#DESTINATIONS[@]} destination(s):"
+        printf '  %s\n' "${DESTINATIONS[@]}"
 
         /kaniko/executor \
-          --context=$GITHUB_WORKSPACE \
-          --dockerfile=${{ inputs.dockerfile }} \
+          --context="$GITHUB_WORKSPACE" \
+          --dockerfile="${{ inputs.dockerfile }}" \
           --kaniko-dir="$KANIKO_DIR" \
-          $DESTINATIONS
+          "${DESTINATIONS[@]}"
 
     - name: Retag existing image (Docker)
       if: steps.check.outputs.exists == 'true' && inputs.push == 'true' && steps.detect.outputs.builder == 'docker'
