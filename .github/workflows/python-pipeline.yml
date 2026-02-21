@@ -181,7 +181,12 @@ jobs:
 
   release:
     needs: [test, docker]
-    if: inputs.enable-release && startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix))
+    if: >-
+      always() &&
+      inputs.enable-release &&
+      startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix)) &&
+      needs.test.result == 'success' &&
+      (needs.docker.result == 'success' || needs.docker.result == 'skipped')
     runs-on: ${{ inputs.runner }}
     container: ${{ inputs.container-image || null }}
     permissions:
