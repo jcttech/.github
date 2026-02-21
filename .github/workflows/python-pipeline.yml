@@ -95,7 +95,13 @@ jobs:
 
       - name: Set outputs
         id: vars
-        run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+        run: |
+          echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          # Extract version from tag for hatch-vcs in build isolation
+          if [[ "$GITHUB_REF" == refs/tags/${{ inputs.tag-prefix }}v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/${{ inputs.tag-prefix }}v}"
+            echo "SETUPTOOLS_SCM_PRETEND_VERSION=$VERSION" >> $GITHUB_ENV
+          fi
 
       - name: Setup Python
         uses: jcttech/.github/.github/actions/python-setup@v1
