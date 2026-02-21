@@ -40,6 +40,10 @@ on:
         type: string
         default: 'ghcr.io/jcttech/devcontainer-base:latest'
         description: 'Container image for job pods (required for ARC K8s mode, empty string for GHA runners)'
+      package-dir:
+        type: string
+        default: '.'
+        description: 'Path to Python package directory for monorepo support (e.g. "packages/my-app")'
 
 jobs:
   changes:
@@ -76,10 +80,15 @@ jobs:
       needs.changes.outputs.code == 'true'
     runs-on: ${{ inputs.runner }}
     container: ${{ inputs.container-image || null }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.package-dir }}
     outputs:
       sha_short: ${{ steps.vars.outputs.sha_short }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Mark workspace safe
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -92,6 +101,7 @@ jobs:
         uses: jcttech/.github/.github/actions/python-setup@v1
         with:
           python-version: ${{ inputs.python-version }}
+          working-directory: ${{ inputs.package-dir }}
 
       - name: Run tests
         run: uv run pytest
@@ -114,7 +124,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: dist
-          path: dist/*
+          path: ${{ inputs.package-dir }}/dist/*
 
   docker:
     needs: [changes, test]
