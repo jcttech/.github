@@ -44,6 +44,10 @@ on:
         type: string
         default: '.'
         description: 'Path to Python package directory for monorepo support (e.g. "packages/my-app")'
+      setup-command:
+        type: string
+        default: ''
+        description: 'Command to run after dependency install but before tests (e.g. proto compilation)'
 
 jobs:
   changes:
@@ -98,16 +102,22 @@ jobs:
         run: |
           echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
           # Extract version from tag for hatch-vcs in build isolation
-          if [[ "$GITHUB_REF" == refs/tags/${{ inputs.tag-prefix }}v* ]]; then
-            VERSION="${GITHUB_REF#refs/tags/${{ inputs.tag-prefix }}v}"
-            echo "SETUPTOOLS_SCM_PRETEND_VERSION=$VERSION" >> $GITHUB_ENV
-          fi
+          case "$GITHUB_REF" in
+            refs/tags/${{ inputs.tag-prefix }}v*)
+              VERSION="${GITHUB_REF#refs/tags/${{ inputs.tag-prefix }}v}"
+              echo "SETUPTOOLS_SCM_PRETEND_VERSION=$VERSION" >> $GITHUB_ENV
+              ;;
+          esac
 
       - name: Setup Python
         uses: jcttech/.github/.github/actions/python-setup@v1
         with:
           python-version: ${{ inputs.python-version }}
           working-directory: ${{ inputs.package-dir }}
+
+      - name: Run setup command
+        if: inputs.setup-command != ''
+        run: ${{ inputs.setup-command }}
 
       - name: Run tests
         run: uv run pytest
