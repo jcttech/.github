@@ -127,7 +127,7 @@ jobs:
 
       - name: Build package
         if: inputs.enable-release && startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix))
-        run: uv build
+        run: uv build --out-dir dist
 
       - name: Stage dist to shared cache
         if: inputs.enable-release && inputs.container-image != '' && startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix))
