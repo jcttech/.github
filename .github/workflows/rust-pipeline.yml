@@ -21,6 +21,14 @@ on:
       enable-release:
         type: boolean
         default: true
+      enable-docs:
+        type: boolean
+        default: false
+        description: 'Enable rustdoc generation and documentation coverage'
+      doc-args:
+        type: string
+        default: '--workspace --no-deps --document-private-items'
+        description: 'Arguments passed to cargo doc'
       enable-database-tests:
         type: boolean
         default: false
@@ -146,6 +154,19 @@ jobs:
       test-command: ${{ inputs.database-test-command }}
       postgres-image: ${{ inputs.postgres-image }}
       rust-version: ${{ inputs.rust-version }}
+      runner: ${{ inputs.runner }}
+      container-image: ${{ inputs.container-image }}
+
+  docs:
+    needs: changes
+    if: >-
+      inputs.enable-docs &&
+      (github.event_name == 'pull_request' ||
+      needs.changes.outputs.code == 'true')
+    uses: jcttech/.github/.github/workflows/rust-docs.yml@v1
+    with:
+      rust-version: ${{ inputs.rust-version }}
+      doc-args: ${{ inputs.doc-args }}
       runner: ${{ inputs.runner }}
       container-image: ${{ inputs.container-image }}
 

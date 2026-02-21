@@ -1,0 +1,92 @@
+name: Rust Documentation
+
+on:
+  workflow_call:
+    inputs:
+      rust-version:
+        type: string
+        default: 'stable'
+        description: 'Rust toolchain version for rustdoc generation'
+      doc-args:
+        type: string
+        default: '--workspace --no-deps --document-private-items'
+        description: 'Arguments passed to cargo doc'
+      enable-coverage:
+        type: boolean
+        default: true
+        description: 'Enable documentation coverage report (requires nightly)'
+      upload-artifact:
+        type: boolean
+        default: true
+        description: 'Upload generated docs as artifact on push to default branch'
+      artifact-retention-days:
+        type: number
+        default: 7
+        description: 'Number of days to retain documentation artifact'
+      runner:
+        type: string
+        default: 'github-arc-github-arc-runner-set'
+        description: 'Runner label for doc generation jobs'
+      container-image:
+        type: string
+        default: 'ghcr.io/jcttech/devcontainer-rust:latest'
+        description: 'Container image for job pods (required for ARC K8s mode, empty string for GHA runners)'
+
+jobs:
+  rustdoc:
+    name: Generate Rustdoc
+    runs-on: ${{ inputs.runner }}
+    container: ${{ inputs.container-image || null }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Mark workspace safe
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Setup Rust
+        uses: jcttech/.github/.github/actions/rust-setup@v1
+        with:
+          rust-version: ${{ inputs.rust-version }}
+          components: rust-docs
+          enable-sccache: 'true'
+
+      - name: Generate documentation
+        run: cargo doc ${{ inputs.doc-args }}
+
+      - name: Upload documentation artifact
+        if: inputs.upload-artifact && github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: rustdoc
+          path: target/doc
+          retention-days: ${{ inputs.artifact-retention-days }}
+
+  doc-coverage:
+    if: inputs.enable-coverage
+    name: Documentation Coverage
+    runs-on: ${{ inputs.runner }}
+    container: ${{ inputs.container-image || null }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Mark workspace safe
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Setup Rust (nightly)
+        uses: jcttech/.github/.github/actions/rust-setup@v1
+        with:
+          rust-version: nightly
+          components: rust-docs
+          enable-sccache: 'true'
+
+      - name: Check documentation coverage
+        run: |
+          RUSTDOCFLAGS="-Z unstable-options --show-coverage" cargo +nightly doc --workspace --no-deps 2>&1 | tee doc-coverage.txt
+          echo "## Documentation Coverage" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat doc-coverage.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+        continue-on-error: true
