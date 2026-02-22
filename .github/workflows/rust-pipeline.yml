@@ -119,6 +119,14 @@ jobs:
         with:
           rust-version: ${{ inputs.rust-version }}
 
+      - name: Extract version from tag
+        if: startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix))
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          PREFIX="${{ inputs.tag-prefix }}"
+          VERSION="${TAG#${PREFIX}v}"
+          echo "APP_VERSION=${VERSION}" >> $GITHUB_ENV
+
       - name: Build
         run: cargo build --release
 
