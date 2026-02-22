@@ -1,0 +1,47 @@
+name: Claude
+
+on:
+  workflow_call:
+    inputs:
+      model:
+        type: string
+        default: 'claude-sonnet-4-6'
+        description: 'Claude model to use'
+      max-turns:
+        type: number
+        default: 30
+        description: 'Maximum conversation turns'
+      timeout-minutes:
+        type: number
+        default: 30
+        description: 'Maximum runtime in minutes'
+      runner:
+        type: string
+        default: 'ubuntu-latest'
+        description: 'GitHub Actions runner to use'
+
+jobs:
+  claude:
+    name: Claude
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: |
+            --model ${{ inputs.model }}
+            --max-turns ${{ inputs.max-turns }}

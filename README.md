@@ -93,6 +93,88 @@ Complete CI/CD for Python projects: change detection, pytest, ruff, Docker, and 
 | `enable-docker` | boolean | `true` | Build and push Docker image |
 | `enable-release` | boolean | `true` | Create GitHub release on tags |
 
+#### `claude-review.yml`
+
+Automated multi-angle PR review powered by Claude. Reviews every PR for code quality, security, bugs, performance, and test coverage.
+
+**Inputs:**
+| Input | Type | Default | Description |
+|-------|------|---------|-------------|
+| `model` | string | `claude-sonnet-4-6` | Claude model to use for review |
+| `max-turns` | number | `10` | Maximum conversation turns (controls cost) |
+| `timeout-minutes` | number | `15` | Maximum runtime in minutes |
+| `runner` | string | `ubuntu-latest` | GitHub Actions runner to use |
+| `review-extra` | string | `''` | Additional review instructions appended to the default prompt |
+
+**Review perspectives (built-in):**
+1. Code quality and maintainability
+2. Security (OWASP Top 10, credential exposure, input validation)
+3. Bug detection (logic errors, race conditions, resource leaks)
+4. Performance (N+1 queries, blocking async, unbounded collections)
+5. Test coverage and quality
+
+#### `claude.yml`
+
+Interactive Claude assistant that responds to `@claude` mentions on PRs and issues. Can read code, suggest fixes, and push commits when asked.
+
+**Inputs:**
+| Input | Type | Default | Description |
+|-------|------|---------|-------------|
+| `model` | string | `claude-sonnet-4-6` | Claude model to use |
+| `max-turns` | number | `30` | Maximum conversation turns |
+| `timeout-minutes` | number | `30` | Maximum runtime in minutes |
+| `runner` | string | `ubuntu-latest` | GitHub Actions runner to use |
+
+**Example caller workflow (add to each repo):**
+```yaml
+# .github/workflows/claude.yml
+name: Claude
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  review:
+    if: github.event_name == 'pull_request'
+    uses: jcttech/.github/.github/workflows/claude-review.yml@v1
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+    secrets: inherit
+
+  interactive:
+    if: |
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude'))
+    uses: jcttech/.github/.github/workflows/claude.yml@v1
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+    secrets: inherit
+```
+
+**Setup:** Requires one of these org-level secrets (Settings > Secrets and variables > Actions):
+
+| Secret | Source | Billing |
+|--------|--------|---------|
+| `CLAUDE_CODE_OAUTH_TOKEN` | Run `claude setup-token` locally | Uses Max/Pro subscription quota |
+| `ANTHROPIC_API_KEY` | console.anthropic.com | Pay-per-token API billing |
+
+**Per-repo customisation:** Add a `CLAUDE.md` file to any repository root with project-specific standards, coding conventions, and review criteria. Claude reads this automatically and applies it on top of the org-wide review prompt.
+
 #### `cleanup-docker.yml`
 
 Scheduled cleanup of old Docker images from GitHub Container Registry.
@@ -164,6 +246,8 @@ Reusable workflows require the calling workflow to grant permissions that nested
 |----------|---------------------|
 | `rust-pipeline.yml` | `contents: write` (releases), `packages: write` (Docker) |
 | `python-pipeline.yml` | `contents: write` (releases), `packages: write` (Docker) |
+| `claude-review.yml` | `contents: read`, `pull-requests: write`, `issues: write`, `id-token: write` |
+| `claude.yml` | `contents: write`, `pull-requests: write`, `issues: write`, `id-token: write`, `actions: read` |
 | `cleanup-docker.yml` | `packages: write` |
 
 ### Features
@@ -173,6 +257,8 @@ Reusable workflows require the calling workflow to grant permissions that nested
 - **Semantic versioning**: Docker tags include `latest`, semver tags (`1.2.3`, `1.2`, `1`)
 - **Cargo caching**: Fast rebuilds with cached dependencies
 - **uv for Python**: Fast dependency installation with built-in caching
+- **Claude PR review**: Automated multi-angle code review on every PR
+- **Claude interactive**: `@claude` mentions for on-demand assistance in PRs and issues
 
 ## Issue Templates
 

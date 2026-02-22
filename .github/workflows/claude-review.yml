@@ -1,0 +1,106 @@
+name: Claude PR Review
+
+on:
+  workflow_call:
+    inputs:
+      model:
+        type: string
+        default: 'claude-sonnet-4-6'
+        description: 'Claude model to use for review'
+      max-turns:
+        type: number
+        default: 10
+        description: 'Maximum conversation turns (controls cost)'
+      timeout-minutes:
+        type: number
+        default: 15
+        description: 'Maximum runtime in minutes'
+      runner:
+        type: string
+        default: 'ubuntu-latest'
+        description: 'GitHub Actions runner to use'
+      review-extra:
+        type: string
+        default: ''
+        description: 'Additional review instructions appended to the default prompt'
+
+jobs:
+  review:
+    name: Claude Review
+    runs-on: ${{ inputs.runner }}
+    if: github.event.pull_request.draft == false
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude PR Review
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          allowed_tools: |
+            Read
+            Glob
+            Grep
+            Bash(git diff:*)
+            Bash(git log:*)
+            Bash(git show:*)
+            Bash(gh pr diff:*)
+            Bash(gh pr view:*)
+            Bash(gh pr comment:*)
+          claude_args: |
+            --model ${{ inputs.model }}
+            --max-turns ${{ inputs.max-turns }}
+          prompt: |
+            You are reviewing PR #${{ github.event.pull_request.number }} in ${{ github.repository }}.
+
+            Perform a thorough code review from the following perspectives:
+
+            ## 1. Code Quality & Maintainability
+            - Is the code clean, readable, and well-structured?
+            - Code smells, unnecessary complexity, or duplication?
+            - Does it follow existing project conventions (check CLAUDE.md if present)?
+            - Are error messages clear and actionable?
+
+            ## 2. Security
+            - OWASP Top 10: injection, XSS, CSRF, SSRF
+            - Sensitive data exposure: credentials, tokens, PII in logs or error messages
+            - Input validation and sanitisation at system boundaries
+            - Authentication and authorisation checks where applicable
+            - Dependency concerns (known vulnerabilities, typosquatting)
+
+            ## 3. Bug Detection
+            - Logic errors, off-by-one, race conditions
+            - Null/undefined handling and edge cases
+            - Resource leaks (file handles, connections, memory)
+            - Error handling gaps (uncaught exceptions, missing error paths)
+            - Type mismatches or incorrect assumptions
+
+            ## 4. Performance
+            - Unnecessary allocations, copies, or clones
+            - N+1 queries or inefficient database access
+            - Missing pagination or unbounded collections
+            - Blocking operations in async contexts
+
+            ## 5. Testing
+            - Are new code paths covered by tests?
+            - Are edge cases and error paths tested?
+            - Do tests assert meaningful behaviour (not just "no crash")?
+
+            ## Review Guidelines
+            - ONLY comment on the changed code (the diff), not pre-existing issues
+            - Use inline comments for line-specific issues
+            - Rate each issue: CRITICAL / HIGH / MEDIUM / LOW
+            - If the PR looks good, say so briefly — do not nitpick for the sake of it
+            - Be constructive: suggest fixes, not just problems
+            - Consider the PR description and linked issues for context
+
+            ${{ inputs.review-extra }}
