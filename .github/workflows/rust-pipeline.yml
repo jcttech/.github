@@ -21,10 +21,18 @@ on:
       enable-release:
         type: boolean
         default: true
+      enable-build:
+        type: boolean
+        default: true
+        description: 'Enable build, clippy, and test job'
       enable-docs:
         type: boolean
         default: false
         description: 'Enable rustdoc generation and documentation coverage'
+      enable-rustdoc:
+        type: boolean
+        default: true
+        description: 'Enable rustdoc generation (only applies when enable-docs is true)'
       doc-args:
         type: string
         default: '--workspace --no-deps --document-private-items'
@@ -97,9 +105,10 @@ jobs:
   build:
     needs: changes
     if: >-
-      startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix)) ||
+      inputs.enable-build &&
+      (startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix)) ||
       github.event_name == 'pull_request' ||
-      needs.changes.outputs.code == 'true'
+      needs.changes.outputs.code == 'true')
     runs-on: ${{ inputs.runner }}
     container: ${{ inputs.container-image || null }}
     outputs:
@@ -175,6 +184,7 @@ jobs:
     with:
       rust-version: ${{ inputs.rust-version }}
       doc-args: ${{ inputs.doc-args }}
+      enable-rustdoc: ${{ inputs.enable-rustdoc }}
       runner: ${{ inputs.runner }}
       container-image: ${{ inputs.container-image }}
 

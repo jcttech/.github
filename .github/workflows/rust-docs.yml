@@ -11,6 +11,10 @@ on:
         type: string
         default: '--workspace --no-deps --document-private-items'
         description: 'Arguments passed to cargo doc'
+      enable-rustdoc:
+        type: boolean
+        default: true
+        description: 'Enable rustdoc generation job'
       enable-coverage:
         type: boolean
         default: true
@@ -34,6 +38,7 @@ on:
 
 jobs:
   rustdoc:
+    if: inputs.enable-rustdoc
     name: Generate Rustdoc
     runs-on: ${{ inputs.runner }}
     container: ${{ inputs.container-image || null }}
