@@ -5,7 +5,7 @@ on:
     inputs:
       model:
         type: string
-        default: 'claude-sonnet-4-6'
+        default: 'claude-opus-4-6'
         description: 'Claude model to use for review'
       max-turns:
         type: number
