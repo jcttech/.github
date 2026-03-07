@@ -65,6 +65,17 @@ jobs:
             - Use `gh pr comment ${{ github.event.pull_request.number }}` for top-level review summary
             - Only post GitHub comments — don't submit review text as conversation messages
 
+            ## Turn Budget
+
+            You have a maximum of ${{ inputs.max-turns }} turns. Plan your work accordingly:
+            - **Turns 1–60%**: Read the diff (`gh pr diff`), explore changed files, understand context
+            - **Turns 60–80%**: Formulate your review findings
+            - **Before turn 80%**: Post your review comment using `gh pr comment`
+
+            CRITICAL: You MUST post a `gh pr comment` with your findings even if your review is incomplete.
+            A partial review is infinitely more useful than no review. If the PR is large and you cannot
+            review everything within your turn budget, post what you have and note which files remain unreviewed.
+
             ## Review Focus Areas
 
             1. **Code Quality**: Clean, readable, well-structured? Following project conventions?
