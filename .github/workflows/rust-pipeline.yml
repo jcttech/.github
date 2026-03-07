@@ -191,6 +191,7 @@ jobs:
   docker:
     needs: [changes, build, database-tests]
     if: >-
+      !failure() && !cancelled() &&
       inputs.enable-docker &&
       (startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix)) ||
       (github.ref == 'refs/heads/main' && needs.changes.outputs.code == 'true'))
@@ -244,7 +245,10 @@ jobs:
 
   release:
     needs: [build, docker, database-tests]
-    if: inputs.enable-release && startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix))
+    if: >-
+      !failure() && !cancelled() &&
+      inputs.enable-release &&
+      startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix))
     runs-on: ${{ inputs.runner }}
     container: ${{ inputs.container-image || null }}
     permissions:
