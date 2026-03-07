@@ -51,44 +51,52 @@ jobs:
           claude_args: |
             --model ${{ inputs.model }}
             --max-turns ${{ inputs.max-turns }}
-            --allowedTools "Read,Glob,Grep,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr comment:*)"
+            --allowedTools "Read,Glob,Grep,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
           prompt: |
-            REPO: ${{ github.repository }}
-            PR NUMBER: ${{ github.event.pull_request.number }}
-
             You are reviewing PR #${{ github.event.pull_request.number }} in ${{ github.repository }}.
             The PR branch is already checked out in the current working directory.
 
-            ## How to Post Your Review
+            ## How Your Review Gets Posted
 
-            IMPORTANT: You MUST post your review as GitHub comments. Do NOT just return text as messages.
-            - Use `gh pr comment ${{ github.event.pull_request.number }}` for top-level review summary
-            - Only post GitHub comments — don't submit review text as conversation messages
+            Your text output IS the review comment — it gets posted automatically as a PR comment.
+            Do NOT call `gh pr comment`. Just write your review as formatted markdown text.
 
-            ## Turn Budget
+            ## Process (follow this exact order)
 
-            You have a maximum of ${{ inputs.max-turns }} turns. Plan your work accordingly:
-            - **Turns 1–60%**: Read the diff (`gh pr diff`), explore changed files, understand context
-            - **Turns 60–80%**: Formulate your review findings
-            - **Before turn 80%**: Post your review comment using `gh pr comment`
+            1. Run `gh pr diff ${{ github.event.pull_request.number }}` to get the full diff.
+            2. If needed, use Read/Glob/Grep to examine specific changed files for more context.
+            3. Output your review as markdown text. Start writing EARLY — a partial review is better than none.
 
-            CRITICAL: You MUST post a `gh pr comment` with your findings even if your review is incomplete.
-            A partial review is infinitely more useful than no review. If the PR is large and you cannot
-            review everything within your turn budget, post what you have and note which files remain unreviewed.
+            You have ${{ inputs.max-turns }} turns total. Use at most HALF for reading code.
+            If you cannot review all files, review what you can and list the rest as unreviewed.
 
-            ## Review Focus Areas
+            ## Review Output Format
 
-            1. **Code Quality**: Clean, readable, well-structured? Following project conventions?
-            2. **Security**: Injection, XSS, exposed secrets, input validation?
-            3. **Bugs**: Logic errors, race conditions, edge cases, resource leaks?
-            4. **Performance**: Unnecessary allocations, N+1 queries, blocking in async?
-            5. **Testing**: New paths covered? Edge cases tested? Meaningful assertions?
+            Structure your review exactly like this:
 
-            ## Review Guidelines
-            - ONLY comment on the changed code (the diff), not pre-existing issues
-            - Rate each issue: CRITICAL / HIGH / MEDIUM / LOW
-            - If the PR looks good, say so briefly — do not nitpick for the sake of it
+            ### Summary
+            One-paragraph summary of what the PR does.
+
+            ### Findings
+            For each issue, use: **[SEVERITY]** `file:line` — Description and suggested fix.
+            Severity: CRITICAL / HIGH / MEDIUM / LOW
+            If no issues, say the PR looks good.
+
+            ### Files Reviewed
+            List files you reviewed. Note any skipped due to turn budget.
+
+            ## What to Look For
+
+            1. **Bugs**: Logic errors, race conditions, edge cases, resource leaks
+            2. **Security**: Injection, XSS, exposed secrets, input validation
+            3. **Code Quality**: Readable, well-structured, follows project conventions
+            4. **Performance**: Unnecessary allocations, N+1 queries, blocking in async
+            5. **Testing**: New code paths covered? Edge cases? Meaningful assertions?
+
+            ## Rules
+            - ONLY comment on changed code (the diff), not pre-existing issues
             - Be constructive: suggest fixes, not just problems
-            - Check CLAUDE.md for project-specific conventions
+            - If the PR looks good, say so — do not invent issues to nitpick
+            - Check CLAUDE.md in the repo root for project-specific conventions
 
             ${{ inputs.review-extra }}
