@@ -51,24 +51,30 @@ jobs:
           claude_args: |
             --model ${{ inputs.model }}
             --max-turns ${{ inputs.max-turns }}
-            --allowedTools "Read,Glob,Grep,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
+            --allowedTools "Read,Glob,Grep,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr comment:*)"
           prompt: |
             You are reviewing PR #${{ github.event.pull_request.number }} in ${{ github.repository }}.
             The PR branch is already checked out in the current working directory.
 
-            ## How Your Review Gets Posted
+            ## How to Post Your Review
 
-            Your text output IS the review comment — it gets posted automatically as a PR comment.
-            Do NOT call `gh pr comment`. Just write your review as formatted markdown text.
+            You MUST post your review using `gh pr comment ${{ github.event.pull_request.number }}`.
+            Your text output alone is NOT posted automatically — you must explicitly run the command.
+
+            CRITICAL: Always post a `gh pr comment` with your findings, even if your review is
+            incomplete. A partial review is infinitely more useful than no review.
 
             ## Process (follow this exact order)
 
             1. Run `gh pr diff ${{ github.event.pull_request.number }}` to get the full diff.
             2. If needed, use Read/Glob/Grep to examine specific changed files for more context.
-            3. Output your review as markdown text. Start writing EARLY — a partial review is better than none.
+            3. Formulate your review findings.
+            4. Post via `gh pr comment ${{ github.event.pull_request.number }} --body "<your review>"`.
 
-            You have ${{ inputs.max-turns }} turns total. Use at most HALF for reading code.
-            If you cannot review all files, review what you can and list the rest as unreviewed.
+            You have ${{ inputs.max-turns }} turns total. Budget your turns carefully:
+            - Use at most HALF for reading code.
+            - Reserve the LAST turn for posting the comment.
+            - If you cannot review all files, review what you can and list the rest as unreviewed.
 
             ## Review Output Format
 
