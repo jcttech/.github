@@ -20,6 +20,10 @@ on:
         type: string
         default: 'ghcr.io/jcttech/devcontainer-rust:latest'
         description: 'Container image for job pods (required for ARC K8s mode, empty string for GHA runners)'
+      init-sql:
+        type: string
+        default: ''
+        description: 'Path to SQL init script run via psql before tests'
 
 jobs:
   database-tests:
@@ -48,6 +52,15 @@ jobs:
         uses: jcttech/.github/.github/actions/rust-setup@v1
         with:
           rust-version: ${{ inputs.rust-version }}
+
+      - name: Initialize database
+        if: inputs.init-sql != ''
+        env:
+          PGHOST: localhost
+          PGUSER: test
+          PGPASSWORD: test
+          PGDATABASE: test_db
+        run: psql -f ${{ inputs.init-sql }}
 
       - name: Run database tests
         env:
