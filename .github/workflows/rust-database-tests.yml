@@ -42,6 +42,9 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+    env:
+      # In containerized jobs, services are accessed by their name; on GHA runners, via localhost
+      PG_HOST: ${{ inputs.container-image && 'postgres' || 'localhost' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -53,10 +56,17 @@ jobs:
         with:
           rust-version: ${{ inputs.rust-version }}
 
+      - name: Install PostgreSQL client
+        if: inputs.init-sql != ''
+        run: |
+          if ! command -v psql &>/dev/null; then
+            apt-get update -qq && apt-get install -y -qq postgresql-client > /dev/null 2>&1 || true
+          fi
+
       - name: Initialize database
         if: inputs.init-sql != ''
         env:
-          PGHOST: localhost
+          PGHOST: ${{ env.PG_HOST }}
           PGUSER: test
           PGPASSWORD: test
           PGDATABASE: test_db
@@ -64,5 +74,5 @@ jobs:
 
       - name: Run database tests
         env:
-          DATABASE_URL: postgres://test:test@localhost:5432/test_db
+          DATABASE_URL: postgres://test:test@${{ env.PG_HOST }}:5432/test_db
         run: ${{ inputs.test-command }}
