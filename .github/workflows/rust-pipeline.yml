@@ -46,6 +46,10 @@ on:
       postgres-image:
         type: string
         default: 'postgres:18'
+      init-sql:
+        type: string
+        default: ''
+        description: 'Path to SQL init script run via psql before database tests'
       tag-prefix:
         type: string
         default: ''
@@ -173,6 +177,7 @@ jobs:
       rust-version: ${{ inputs.rust-version }}
       runner: ${{ inputs.runner }}
       container-image: ${{ inputs.container-image }}
+      init-sql: ${{ inputs.init-sql }}
 
   docs:
     needs: changes
