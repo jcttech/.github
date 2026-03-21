@@ -24,6 +24,10 @@ on:
         type: string
         default: ''
         description: 'Path to SQL init script run via psql before tests'
+      pg-host:
+        type: string
+        default: 'localhost'
+        description: 'PostgreSQL service hostname (localhost for ARC K8s and GHA runners, service name for Docker-mode runners)'
 
 jobs:
   database-tests:
@@ -43,8 +47,7 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     env:
-      # In containerized jobs, services are accessed by their name; on GHA runners, via localhost
-      PG_HOST: ${{ inputs.container-image && 'postgres' || 'localhost' }}
+      PG_HOST: ${{ inputs.pg-host }}
     steps:
       - uses: actions/checkout@v4
 
