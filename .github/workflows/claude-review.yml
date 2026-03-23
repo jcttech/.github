@@ -9,11 +9,11 @@ on:
         description: 'Claude model to use for review'
       max-turns:
         type: number
-        default: 20
+        default: 50
         description: 'Maximum conversation turns (controls cost)'
       timeout-minutes:
         type: number
-        default: 15
+        default: 20
         description: 'Maximum runtime in minutes'
       runner:
         type: string
@@ -51,7 +51,7 @@ jobs:
           claude_args: |
             --model ${{ inputs.model }}
             --max-turns ${{ inputs.max-turns }}
-            --allowedTools "Read,Glob,Grep,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr comment:*)"
+            --allowedTools "Read,Glob,Grep,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr comment:*),Bash(gh pr checks:*),Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(find:*),Bash(tree:*),Bash(file:*)"
           prompt: |
             You are reviewing PR #${{ github.event.pull_request.number }} in ${{ github.repository }}.
             The PR branch is already checked out in the current working directory.
