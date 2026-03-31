@@ -107,21 +107,66 @@ jobs:
             reviews from previous runs:
             ```bash
             gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews \
-              --jq '.[] | select(.user.login == "github-actions[bot]") | {state, body}'
+              --jq '.[] | select(.user.login == "github-actions[bot]") | {id: .id, state: .state, body: .body}'
             ```
             If previous reviews exist with REQUEST_CHANGES:
-            - Check if the previous findings have been addressed in the new diff
-            - If all addressed → post an APPROVE review noting what was fixed
-            - If some remain → post REQUEST_CHANGES with only the unresolved findings
+            1. Fetch the inline comments from the previous review(s)
+            2. Check if each finding has been addressed in the new diff
+            3. **Resolve addressed conversations** using the GraphQL API:
+               ```bash
+               # First, get all unresolved review threads
+               gh api graphql -f query='
+                 query {
+                   repository(owner: "${{ github.repository_owner }}", name: "${{ github.event.repository.name }}") {
+                     pullRequest(number: ${{ github.event.pull_request.number }}) {
+                       reviewThreads(first: 100) {
+                         nodes {
+                           id
+                           isResolved
+                           comments(first: 1) {
+                             nodes { author { login } body }
+                           }
+                         }
+                       }
+                     }
+                   }
+                 }'
+               # Then resolve each addressed thread
+               gh api graphql -f query='
+                 mutation {
+                   resolveReviewThread(input: {threadId: "THREAD_ID"}) {
+                     thread { isResolved }
+                   }
+                 }'
+               ```
+            4. If ALL findings addressed → resolve all threads, then post an **APPROVE** review
+            5. If some remain → resolve the addressed threads, post REQUEST_CHANGES with only unresolved findings
+
+            ### Approving the PR
+
+            When posting an APPROVE review, you MUST also dismiss any previous REQUEST_CHANGES
+            review so the PR is not blocked:
+            ```bash
+            # Find previous REQUEST_CHANGES review IDs from github-actions[bot]
+            gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews \
+              --jq '.[] | select(.user.login == "github-actions[bot]" and .state == "CHANGES_REQUESTED") | .id'
+            # Dismiss each one
+            gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews/REVIEW_ID/dismissals \
+              -f message="All findings addressed — review approved." -f event="DISMISS"
+            ```
+            Then post the APPROVE review as normal.
 
             ## Process (follow this exact order)
 
             1. Run `gh pr diff ${{ github.event.pull_request.number }}` to get the full diff.
             2. Check for previous reviews from `github-actions[bot]` to see if this is a re-review.
-            3. If needed, use Read/Glob/Grep to examine specific changed files for more context.
-            4. Formulate your review findings, mapping each to a specific diff line where possible.
-            5. Build the review JSON payload with inline comments.
-            6. Post via `gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews`.
+            3. If re-review: fetch previous inline comments and review threads, determine which are addressed.
+            4. If needed, use Read/Glob/Grep to examine specific changed files for more context.
+            5. Formulate your review findings, mapping each to a specific diff line where possible.
+            6. Resolve addressed review thread conversations via GraphQL API.
+            7. Build the review JSON payload with inline comments (only unresolved findings).
+            8. Post via `gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews`.
+            9. If APPROVE: dismiss any previous REQUEST_CHANGES reviews so the PR is unblocked.
 
             You have ${{ inputs.max-turns }} turns total. Budget your turns carefully:
             - Use at most HALF for reading code.
