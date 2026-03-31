@@ -47,46 +47,99 @@ jobs:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ github.token }}
-          use_sticky_comment: true
+          use_sticky_comment: false
           claude_args: |
             --model ${{ inputs.model }}
             --max-turns ${{ inputs.max-turns }}
-            --allowedTools "Read,Glob,Grep,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr comment:*),Bash(gh pr checks:*),Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(find:*),Bash(tree:*),Bash(file:*)"
+            --allowedTools "Read,Glob,Grep,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr comment:*),Bash(gh pr review:*),Bash(gh pr checks:*),Bash(gh api:*),Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(find:*),Bash(tree:*),Bash(file:*),Bash(echo:*),Bash(mktemp:*),Write"
           prompt: |
             You are reviewing PR #${{ github.event.pull_request.number }} in ${{ github.repository }}.
             The PR branch is already checked out in the current working directory.
 
             ## How to Post Your Review
 
-            You MUST post your review using `gh pr comment ${{ github.event.pull_request.number }}`.
-            Your text output alone is NOT posted automatically — you must explicitly run the command.
+            You MUST post your review as a **GitHub Pull Request Review** with inline comments
+            on specific lines of the diff — NOT as a general PR comment.
 
-            CRITICAL: Always post a `gh pr comment` with your findings, even if your review is
-            incomplete. A partial review is infinitely more useful than no review.
+            Use the GitHub API to submit a review with inline comments:
+
+            ```bash
+            # Write review payload to a temp file, then submit
+            cat > /tmp/review.json << 'REVIEW_JSON'
+            {
+              "event": "REQUEST_CHANGES",
+              "body": "### Summary\n...\n\n### Findings\n...",
+              "comments": [
+                {
+                  "path": "src/example.rs",
+                  "line": 42,
+                  "body": "**[MEDIUM]** Description of the issue and suggested fix."
+                }
+              ]
+            }
+            REVIEW_JSON
+            gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews \
+              --input /tmp/review.json
+            ```
+
+            ### Review Event Rules
+            - **`REQUEST_CHANGES`**: Use when there are CRITICAL, HIGH, or MEDIUM findings
+            - **`COMMENT`**: Use when there are only LOW findings
+            - **`APPROVE`**: Use when the PR looks good with no issues (or trivial observations only)
+
+            CRITICAL: Always post a review, even if incomplete. A partial review is better than none.
+
+            ### Mapping Findings to Diff Lines
+
+            Each inline comment MUST reference a line that appears in the PR diff. To find the
+            correct line numbers:
+            1. Run `gh pr diff ${{ github.event.pull_request.number }}` to see the diff
+            2. Note the `+` lines and their line numbers (shown after `@@` markers)
+            3. Use the NEW file line number (right side of the diff) for the `line` field
+            4. The `path` must match the file path exactly as shown in the diff
+
+            If a finding applies to a range or general pattern rather than a specific line,
+            include it in the review `body` summary instead of as an inline comment.
+
+            ### Handling Re-reviews (new pushes to the PR)
+
+            When the PR has been updated (synchronize event), check if there are existing
+            reviews from previous runs:
+            ```bash
+            gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews \
+              --jq '.[] | select(.user.login == "github-actions[bot]") | {state, body}'
+            ```
+            If previous reviews exist with REQUEST_CHANGES:
+            - Check if the previous findings have been addressed in the new diff
+            - If all addressed → post an APPROVE review noting what was fixed
+            - If some remain → post REQUEST_CHANGES with only the unresolved findings
 
             ## Process (follow this exact order)
 
             1. Run `gh pr diff ${{ github.event.pull_request.number }}` to get the full diff.
-            2. If needed, use Read/Glob/Grep to examine specific changed files for more context.
-            3. Formulate your review findings.
-            4. Post via `gh pr comment ${{ github.event.pull_request.number }} --body "<your review>"`.
+            2. Check for previous reviews from `github-actions[bot]` to see if this is a re-review.
+            3. If needed, use Read/Glob/Grep to examine specific changed files for more context.
+            4. Formulate your review findings, mapping each to a specific diff line where possible.
+            5. Build the review JSON payload with inline comments.
+            6. Post via `gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews`.
 
             You have ${{ inputs.max-turns }} turns total. Budget your turns carefully:
             - Use at most HALF for reading code.
-            - Reserve the LAST turn for posting the comment.
+            - Reserve the LAST 2 turns for building and posting the review.
             - If you cannot review all files, review what you can and list the rest as unreviewed.
 
-            ## Review Output Format
+            ## Review Body Format
 
-            Structure your review exactly like this:
+            Structure the review body (the `body` field in the JSON) like this:
+
+            ## Review — PR #${{ github.event.pull_request.number }}
 
             ### Summary
             One-paragraph summary of what the PR does.
 
             ### Findings
-            For each issue, use: **[SEVERITY]** `file:line` — Description and suggested fix.
-            Severity: CRITICAL / HIGH / MEDIUM / LOW
-            If no issues, say the PR looks good.
+            Brief list of findings with severity. Detailed comments are inline on the diff.
+            If no issues: "PR looks good — no issues found."
 
             ### Files Reviewed
             List files you reviewed. Note any skipped due to turn budget.
@@ -104,5 +157,7 @@ jobs:
             - Be constructive: suggest fixes, not just problems
             - If the PR looks good, say so — do not invent issues to nitpick
             - Check CLAUDE.md in the repo root for project-specific conventions
+            - Inline comments must reference lines that exist in the diff (new file line numbers)
+            - Do NOT post a general `gh pr comment` — use the review API only
 
             ${{ inputs.review-extra }}
