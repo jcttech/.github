@@ -101,72 +101,80 @@ jobs:
             If a finding applies to a range or general pattern rather than a specific line,
             include it in the review `body` summary instead of as an inline comment.
 
-            ### Handling Re-reviews (new pushes to the PR)
+            ### Handling Re-reviews (CRITICAL — read carefully)
 
-            When the PR has been updated (synchronize event), check if there are existing
-            reviews from previous runs:
+            EVERY run must start by checking for existing reviews from previous runs.
+            This prevents duplicate comments — the #1 most important rule for re-reviews.
+
+            **Step A — Fetch existing review threads:**
             ```bash
-            gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews \
-              --jq '.[] | select(.user.login == "github-actions[bot]") | {id: .id, state: .state, body: .body}'
+            # Get all review threads with their resolved status, file path, and comment body
+            gh api graphql -f query='
+              query {
+                repository(owner: "${{ github.repository_owner }}", name: "${{ github.event.repository.name }}") {
+                  pullRequest(number: ${{ github.event.pull_request.number }}) {
+                    reviewThreads(first: 100) {
+                      nodes {
+                        id
+                        isResolved
+                        path
+                        line
+                        comments(first: 1) {
+                          nodes { author { login } body }
+                        }
+                      }
+                    }
+                  }
+                }
+              }'
             ```
-            If previous reviews exist with REQUEST_CHANGES:
-            1. Fetch the inline comments from the previous review(s)
-            2. Check if each finding has been addressed in the new diff
-            3. **Resolve addressed conversations** using the GraphQL API:
-               ```bash
-               # First, get all unresolved review threads
-               gh api graphql -f query='
-                 query {
-                   repository(owner: "${{ github.repository_owner }}", name: "${{ github.event.repository.name }}") {
-                     pullRequest(number: ${{ github.event.pull_request.number }}) {
-                       reviewThreads(first: 100) {
-                         nodes {
-                           id
-                           isResolved
-                           comments(first: 1) {
-                             nodes { author { login } body }
-                           }
-                         }
-                       }
-                     }
-                   }
-                 }'
-               # Then resolve each addressed thread
-               gh api graphql -f query='
-                 mutation {
-                   resolveReviewThread(input: {threadId: "THREAD_ID"}) {
-                     thread { isResolved }
-                   }
-                 }'
-               ```
-            4. If ALL findings addressed → resolve all threads, then post an **APPROVE** review
-            5. If some remain → resolve the addressed threads, post REQUEST_CHANGES with only unresolved findings
+
+            **Step B — Categorise each existing thread from `github-actions[bot]`:**
+            Compare each unresolved thread against the current diff:
+            - **Addressed**: The code at that file/line has changed and the issue is fixed → resolve it
+            - **Still relevant**: The same problematic code is still in the diff → leave it open, do NOT re-post
+            - **Outdated**: The file/line no longer exists in the diff → resolve it
+
+            **Step C — Resolve addressed/outdated threads:**
+            ```bash
+            gh api graphql -f query='
+              mutation { resolveReviewThread(input: {threadId: "THREAD_NODE_ID"}) { thread { isResolved } } }'
+            ```
+
+            **Step D — Post your review with ONLY genuinely new findings:**
+            - Do NOT include any finding that already has an unresolved thread (same file, same issue)
+            - Only post inline comments for NEW issues discovered in the current diff
+            - If there are no new findings AND all previous threads are resolved → APPROVE
+            - If there are no new findings but some previous threads remain unresolved → do NOT post a new review (the existing threads already cover it)
+            - If there are new findings → post REQUEST_CHANGES/COMMENT with only the new ones
 
             ### Approving the PR
 
-            When posting an APPROVE review, you MUST also dismiss any previous REQUEST_CHANGES
-            review so the PR is not blocked:
-            ```bash
-            # Find previous REQUEST_CHANGES review IDs from github-actions[bot]
-            gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews \
-              --jq '.[] | select(.user.login == "github-actions[bot]" and .state == "CHANGES_REQUESTED") | .id'
-            # Dismiss each one
-            gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews/REVIEW_ID/dismissals \
-              -f message="All findings addressed — review approved." -f event="DISMISS"
-            ```
-            Then post the APPROVE review as normal.
+            When ALL findings (old and new) are resolved:
+            1. Resolve all remaining review threads (Step C above)
+            2. Dismiss any previous REQUEST_CHANGES reviews so the PR is not blocked:
+               ```bash
+               gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews \
+                 --jq '.[] | select(.user.login == "github-actions[bot]" and .state == "CHANGES_REQUESTED") | .id' \
+               | while read -r review_id; do
+                   gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews/${review_id}/dismissals" \
+                     -f message="All findings addressed." -f event="DISMISS"
+                 done
+               ```
+            3. Post an APPROVE review summarising what was fixed
 
             ## Process (follow this exact order)
 
             1. Run `gh pr diff ${{ github.event.pull_request.number }}` to get the full diff.
-            2. Check for previous reviews from `github-actions[bot]` to see if this is a re-review.
-            3. If re-review: fetch previous inline comments and review threads, determine which are addressed.
-            4. If needed, use Read/Glob/Grep to examine specific changed files for more context.
-            5. Formulate your review findings, mapping each to a specific diff line where possible.
-            6. Resolve addressed review thread conversations via GraphQL API.
-            7. Build the review JSON payload with inline comments (only unresolved findings).
-            8. Post via `gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews`.
-            9. If APPROVE: dismiss any previous REQUEST_CHANGES reviews so the PR is unblocked.
+            2. **Always** fetch existing review threads from `github-actions[bot]` (Step A above).
+            3. Categorise each existing thread: addressed, still relevant, or outdated (Step B).
+            4. Resolve addressed and outdated threads (Step C).
+            5. If needed, use Read/Glob/Grep to examine specific changed files for more context.
+            6. Formulate NEW findings only — skip anything already covered by an open thread.
+            7. Decide: APPROVE (all clear), skip posting (no new findings, old threads cover it), or REQUEST_CHANGES/COMMENT (new findings).
+            8. Build the review JSON payload with inline comments for new findings only.
+            9. Post via `gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews`.
+            10. If APPROVE: dismiss previous REQUEST_CHANGES reviews so the PR is unblocked.
 
             You have ${{ inputs.max-turns }} turns total. Budget your turns carefully:
             - Use at most HALF for reading code.
@@ -199,6 +207,7 @@ jobs:
 
             ## Rules
             - ONLY comment on changed code (the diff), not pre-existing issues
+            - **NEVER duplicate comments** — if an unresolved thread already exists for a finding (same file, same issue), do NOT post it again. This is the most important rule.
             - Be constructive: suggest fixes, not just problems
             - If the PR looks good, say so — do not invent issues to nitpick
             - Check CLAUDE.md in the repo root for project-specific conventions
