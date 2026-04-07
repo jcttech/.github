@@ -39,18 +39,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          fetch-depth: 0
 
-      - name: Fetch existing review threads
-        id: threads
+      - name: Resolve addressed threads before review
+        id: pre-resolve
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Fetch all review threads from github-actions[bot] for dedup context
+          set -euo pipefail
+          PR=${{ github.event.pull_request.number }}
+
+          # Fetch all review threads from github-actions[bot]
           gh api graphql -f query='
             query {
               repository(owner: "${{ github.repository_owner }}", name: "${{ github.event.repository.name }}") {
-                pullRequest(number: ${{ github.event.pull_request.number }}) {
+                pullRequest(number: '"$PR"') {
                   reviewThreads(first: 100) {
                     nodes {
                       id
@@ -66,14 +69,52 @@ jobs:
               }
             }' > /tmp/review-threads.json 2>/dev/null || echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}' > /tmp/review-threads.json
 
-          # Extract unresolved threads from github-actions[bot] into a readable summary
-          python3 -c "
-          import json, sys
+          # Get the diff line ranges to detect which lines were modified in the latest push
+          # Also get list of files in the diff
+          gh pr diff "$PR" --name-only > /tmp/diff-files.txt 2>/dev/null || touch /tmp/diff-files.txt
+          gh pr diff "$PR" > /tmp/full-diff.txt 2>/dev/null || touch /tmp/full-diff.txt
+
+          # Resolve threads where the commented line was modified or the file was removed from the diff.
+          # This breaks the circular dependency: fixed issues get resolved BEFORE Claude runs,
+          # so Claude only sees genuinely outstanding threads.
+          python3 << 'PYEOF'
+          import json, re, subprocess, sys
+
+          # Parse diff to find changed line ranges per file
+          diff_text = open('/tmp/full-diff.txt').read()
+          diff_files = set(l.strip() for l in open('/tmp/diff-files.txt') if l.strip())
+
+          # Build a map of file -> set of changed line numbers (new-side)
+          changed_lines = {}  # path -> set of line numbers
+          current_file = None
+          hunk_re = re.compile(r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@')
+          diff_header_re = re.compile(r'^diff --git a/.+ b/(.+)$')
+
+          for line in diff_text.splitlines():
+              m = diff_header_re.match(line)
+              if m:
+                  current_file = m.group(1)
+                  if current_file not in changed_lines:
+                      changed_lines[current_file] = set()
+                  continue
+
+              m = hunk_re.match(line)
+              if m and current_file:
+                  start = int(m.group(1))
+                  count = int(m.group(2)) if m.group(2) else 1
+                  # Track all lines in the hunk range as "changed region"
+                  for i in range(start, start + count):
+                      changed_lines[current_file].add(i)
+
+          # Load threads
           data = json.load(open('/tmp/review-threads.json'))
-          threads = data['data']['repository']['pullRequest']['reviewThreads']['nodes']
-          unresolved = []
+          threads = data.get('data', {}).get('repository', {}).get('pullRequest', {}).get('reviewThreads', {}).get('nodes', [])
+
+          resolved_count = 0
+          remaining = []
+
           for t in threads:
-              if t['isResolved']:
+              if t.get('isResolved'):
                   continue
               comments = t.get('comments', {}).get('nodes', [])
               if not comments:
@@ -81,15 +122,50 @@ jobs:
               author = comments[0].get('author', {}).get('login', '')
               if author != 'github-actions[bot]':
                   continue
-              unresolved.append({
-                  'id': t['id'],
-                  'path': t.get('path', ''),
-                  'line': t.get('line'),
-                  'body': comments[0].get('body', '')[:200]
-              })
-          json.dump(unresolved, open('/tmp/unresolved-threads.json', 'w'), indent=2)
-          print(f'Found {len(unresolved)} unresolved review threads from previous runs')
-          " 2>/dev/null || echo "[]" > /tmp/unresolved-threads.json
+
+              thread_id = t['id']
+              path = t.get('path', '')
+              line = t.get('line')
+              should_resolve = False
+
+              if path and path not in diff_files:
+                  # File no longer in the diff — thread is outdated
+                  should_resolve = True
+              elif path and line and path in changed_lines:
+                  # Check if the commented line falls within a changed hunk
+                  file_changes = changed_lines[path]
+                  if line in file_changes:
+                      should_resolve = True
+
+              if should_resolve:
+                  result = subprocess.run(
+                      ['gh', 'api', 'graphql', '-f',
+                       f'query=mutation {{ resolveReviewThread(input: {{threadId: "{thread_id}"}}) {{ thread {{ isResolved }} }} }}'],
+                      capture_output=True, text=True
+                  )
+                  if result.returncode == 0:
+                      resolved_count += 1
+                      print(f'Pre-resolved thread on {path}:{line} (line was modified)')
+                  else:
+                      print(f'Failed to resolve thread {thread_id}: {result.stderr}', file=sys.stderr)
+                      # Keep it in remaining if resolution failed
+                      remaining.append({
+                          'id': thread_id,
+                          'path': path,
+                          'line': line,
+                          'body': comments[0].get('body', '')[:200]
+                      })
+              else:
+                  remaining.append({
+                      'id': thread_id,
+                      'path': path,
+                      'line': line,
+                      'body': comments[0].get('body', '')[:200]
+                  })
+
+          json.dump(remaining, open('/tmp/unresolved-threads.json', 'w'), indent=2)
+          print(f'Pre-resolved {resolved_count} addressed thread(s), {len(remaining)} still unresolved')
+          PYEOF
 
       - name: Run Claude PR Review
         uses: anthropics/claude-code-action@v1
@@ -135,7 +211,7 @@ jobs:
             ### Review Event Rules
             - **`REQUEST_CHANGES`**: Use when there are CRITICAL, HIGH, or MEDIUM findings
             - **`COMMENT`**: Use when there are only LOW findings
-            - **`APPROVE`**: Use when the PR looks good with no issues (or trivial observations only)
+            - **`APPROVE`**: Use when the PR looks good with no new issues, OR when all previous issues have been addressed
 
             CRITICAL: Always post a review, even if incomplete. A partial review is better than none.
 
@@ -154,6 +230,9 @@ jobs:
             ### Handling Re-reviews (CRITICAL — prevents duplicate comments)
 
             A previous step has pre-fetched existing unresolved review threads into `/tmp/unresolved-threads.json`.
+            Threads for issues that were already addressed (commented line was modified) have been
+            automatically resolved — only genuinely outstanding threads remain in this file.
+
             Read this file FIRST:
             ```bash
             cat /tmp/unresolved-threads.json
@@ -165,11 +244,16 @@ jobs:
             - For each finding you would post, check if `/tmp/unresolved-threads.json` already has
               a thread on the same `path` covering the same issue → do NOT re-post it
             - Only post inline comments for genuinely NEW issues not covered by existing threads
-            - If there are no new findings AND existing threads still cover unresolved issues → do NOT post a new review at all
-            - If all previous issues have been fixed and no new issues → post **APPROVE**
 
-            **You do NOT need to resolve threads or dismiss reviews** — a post-step handles that
-            automatically based on your review decision. Just focus on reviewing code correctly.
+            **Re-review decision logic (follow this exactly):**
+            1. If `/tmp/unresolved-threads.json` is empty (`[]`) AND you find no new issues → post **APPROVE** (all previous issues were fixed)
+            2. If `/tmp/unresolved-threads.json` is empty (`[]`) AND you find new issues → post **REQUEST_CHANGES** or **COMMENT** with only the new findings
+            3. If `/tmp/unresolved-threads.json` has entries AND you find no new issues → do NOT post a new review (existing threads already cover it)
+            4. If `/tmp/unresolved-threads.json` has entries AND you find new issues → post **REQUEST_CHANGES** or **COMMENT** with only the new findings
+
+            **IMPORTANT**: When the unresolved threads list is empty, it means ALL previous issues
+            were addressed. You MUST post an **APPROVE** review unless you find genuinely new problems
+            in the code. Do not skip posting — the APPROVE is needed to unblock the PR.
 
             ## Process (follow this exact order)
 
@@ -177,7 +261,7 @@ jobs:
             2. Run `gh pr diff ${{ github.event.pull_request.number }}` to get the full diff.
             3. If needed, use Read/Glob/Grep to examine specific changed files for more context.
             4. Formulate findings — skip anything already covered by an existing unresolved thread.
-            5. Decide: APPROVE (all previous issues fixed, no new issues), REQUEST_CHANGES/COMMENT (new findings only), or skip (no new findings, existing threads cover it).
+            5. Follow the re-review decision logic above to decide your review event type.
             6. Build the review JSON payload with inline comments for new findings only.
             7. Post via `gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews`.
             Note: Thread resolution and review dismissal happen automatically in a post-step.
@@ -237,9 +321,6 @@ jobs:
 
           echo "Latest bot review state: ${LATEST_STATE:-none}"
 
-          # Get the current diff paths to detect outdated threads
-          DIFF_FILES=$(gh pr diff "$PR" --name-only 2>/dev/null || true)
-
           # Fetch current unresolved threads from github-actions[bot]
           THREADS=$(gh api graphql -f query='
             query {
@@ -260,14 +341,13 @@ jobs:
               }
             }' 2>/dev/null || echo '{}')
 
-          # Resolve threads that are outdated (file no longer in diff) or if latest review is APPROVE
-          echo "$THREADS" | python3 -c "
-          import json, sys, subprocess, os
+          # Resolve all remaining bot threads if latest review is APPROVE
+          if [ "$LATEST_STATE" = "APPROVED" ]; then
+            echo "Latest review is APPROVE — resolving all remaining bot threads"
+            echo "$THREADS" | python3 -c "
+          import json, sys, subprocess
 
-          diff_files = set(os.environ.get('DIFF_FILES', '').strip().split('\n'))
-          latest_state = os.environ.get('LATEST_STATE', '')
           data = json.load(sys.stdin)
-
           threads = data.get('data', {}).get('repository', {}).get('pullRequest', {}).get('reviewThreads', {}).get('nodes', [])
 
           resolved_count = 0
@@ -283,32 +363,24 @@ jobs:
 
               thread_id = t['id']
               path = t.get('path', '')
-              should_resolve = False
+              result = subprocess.run(
+                  ['gh', 'api', 'graphql', '-f',
+                   f'query=mutation {{ resolveReviewThread(input: {{threadId: \"{thread_id}\"}}) {{ thread {{ isResolved }} }} }}'],
+                  capture_output=True, text=True
+              )
+              if result.returncode == 0:
+                  resolved_count += 1
+                  print(f'Resolved thread on {path}:{t.get(\"line\", \"?\")}')
+              else:
+                  print(f'Failed to resolve thread {thread_id}: {result.stderr}', file=sys.stderr)
 
-              # Resolve if latest review approved everything
-              if latest_state == 'APPROVED':
-                  should_resolve = True
-              # Resolve if the file is no longer in the diff (outdated)
-              elif path and path not in diff_files:
-                  should_resolve = True
-
-              if should_resolve:
-                  result = subprocess.run(
-                      ['gh', 'api', 'graphql', '-f', 'query=mutation { resolveReviewThread(input: {threadId: \"' + thread_id + '\"}) { thread { isResolved } } }'],
-                      capture_output=True, text=True
-                  )
-                  if result.returncode == 0:
-                      resolved_count += 1
-                      print(f'Resolved thread on {path}:{t.get(\"line\", \"?\")}')
-                  else:
-                      print(f'Failed to resolve thread {thread_id}: {result.stderr}', file=sys.stderr)
-
-          print(f'Resolved {resolved_count} review thread(s)')
+          print(f'Resolved {resolved_count} remaining thread(s) after approval')
           "
+          fi
 
           # If latest review is APPROVE, dismiss any previous REQUEST_CHANGES
           if [ "$LATEST_STATE" = "APPROVED" ]; then
-            echo "Latest review is APPROVE — dismissing stale REQUEST_CHANGES reviews"
+            echo "Dismissing stale REQUEST_CHANGES reviews"
             gh api "repos/${REPO}/pulls/${PR}/reviews" \
               --jq '.[] | select(.user.login == "github-actions[bot]" and .state == "CHANGES_REQUESTED") | .id' \
             | while read -r review_id; do
