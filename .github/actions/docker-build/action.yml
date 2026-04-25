@@ -116,9 +116,9 @@ runs:
         META_TAGS: ${{ steps.meta.outputs.tags }}
         META_LABELS: ${{ steps.meta.outputs.labels }}
       run: |
-        # Build tag and label flags from metadata
+        # Build tag and label flags from metadata (quote labels to handle spaces)
         TAG_ARGS=$(echo "$META_TAGS" | sed '/^$/d' | sed 's/^/-t /' | tr '\n' ' ')
-        LABEL_ARGS=$(echo "$META_LABELS" | sed '/^$/d' | sed 's/^/--label /' | tr '\n' ' ')
+        LABEL_ARGS=$(echo "$META_LABELS" | sed '/^$/d' | sed 's/^/--label "/' | sed 's/$/"/' | tr '\n' ' ')
 
         echo "Building image..."
         eval podman build --file "${{ inputs.dockerfile }}" $TAG_ARGS $LABEL_ARGS .
