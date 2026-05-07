@@ -132,6 +132,18 @@ jobs:
         with:
           rust-version: ${{ inputs.rust-version }}
 
+      - name: Configure cargo for private git deps
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          if [ -z "$PRIVATE_REPO_TOKEN" ]; then
+            echo "PRIVATE_REPO_TOKEN not set; cargo will use anonymous git access only"
+            exit 0
+          fi
+          git config --global url."https://x-access-token:${PRIVATE_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
+          echo "CARGO_NET_GIT_FETCH_WITH_CLI=true" >> "$GITHUB_ENV"
+          echo "Configured private git auth via PRIVATE_REPO_TOKEN for cargo fetch"
+
       - name: Extract version from tag
         if: startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix))
         run: |

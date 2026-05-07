@@ -56,6 +56,18 @@ jobs:
           components: rust-docs
           enable-sccache: 'true'
 
+      - name: Configure cargo for private git deps
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          if [ -z "$PRIVATE_REPO_TOKEN" ]; then
+            echo "PRIVATE_REPO_TOKEN not set; cargo will use anonymous git access only"
+            exit 0
+          fi
+          git config --global url."https://x-access-token:${PRIVATE_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
+          echo "CARGO_NET_GIT_FETCH_WITH_CLI=true" >> "$GITHUB_ENV"
+          echo "Configured private git auth via PRIVATE_REPO_TOKEN for cargo fetch"
+
       - name: Generate documentation
         run: cargo doc ${{ inputs.doc-args }}
 
@@ -86,6 +98,18 @@ jobs:
           rust-version: nightly
           components: rust-docs
           enable-sccache: 'true'
+
+      - name: Configure cargo for private git deps
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          if [ -z "$PRIVATE_REPO_TOKEN" ]; then
+            echo "PRIVATE_REPO_TOKEN not set; cargo will use anonymous git access only"
+            exit 0
+          fi
+          git config --global url."https://x-access-token:${PRIVATE_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
+          echo "CARGO_NET_GIT_FETCH_WITH_CLI=true" >> "$GITHUB_ENV"
+          echo "Configured private git auth via PRIVATE_REPO_TOKEN for cargo fetch"
 
       - name: Check documentation coverage
         run: |
