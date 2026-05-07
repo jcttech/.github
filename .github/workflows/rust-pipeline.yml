@@ -183,6 +183,7 @@ jobs:
       github.event_name == 'pull_request' ||
       needs.changes.outputs.code == 'true')
     uses: jcttech/.github/.github/workflows/rust-database-tests.yml@v1
+    secrets: inherit
     with:
       test-command: ${{ inputs.database-test-command }}
       postgres-image: ${{ inputs.postgres-image }}
@@ -198,6 +199,7 @@ jobs:
       (github.event_name == 'pull_request' ||
       needs.changes.outputs.code == 'true')
     uses: jcttech/.github/.github/workflows/rust-docs.yml@v1
+    secrets: inherit
     with:
       rust-version: ${{ inputs.rust-version }}
       doc-args: ${{ inputs.doc-args }}
