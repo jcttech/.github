@@ -1,0 +1,127 @@
+# OpenAPI Drift Check — reusable workflow
+#
+# Generalises the OpenAPI drift-detection pattern: run a project-supplied
+# `print-command` to emit the live OpenAPI spec, diff it against a committed
+# spec file in the repo, and fail on any drift.
+#
+# Inputs:
+#   print-command         (required) — command run inside `working-directory`
+#                                       that prints the live OpenAPI spec to
+#                                       stdout. Example:
+#                                       `cargo run -p jtrader-server -- --print-openapi`.
+#   committed-spec-path   (required) — path (relative to the repository
+#                                       root) of the committed spec file
+#                                       the live output is diffed against.
+#   working-directory     (default `.`) — directory in which `print-command`
+#                                       runs. Does NOT affect resolution
+#                                       of `committed-spec-path`, which
+#                                       is always repo-root-relative.
+#   container-image       (default `ghcr.io/jcttech/devcontainer-rust-leptos:latest`)
+#                                     — container image for the job pod
+#                                       (ARC K8s mode).
+#   code-paths            (default `''`) — D1 docs-only fast-lane filter.
+#                                       Optional newline-separated glob list.
+#                                       When set, the workflow's first
+#                                       step runs `dorny/paths-filter@v4` on
+#                                       PR events; if nothing matches, every
+#                                       subsequent step is skipped (job
+#                                       exits green in <30 s with no
+#                                       `print-command` execution in the
+#                                       log). Empty default = always run.
+#                                       Push events always run regardless
+#                                       of this filter.
+#
+# D1 fast-lane (per Spec jcttech/trading#185 §D1): the `code-paths:` input
+# is the standardised docs-only skip mechanism shared by the new sibling
+# reusable workflows in this repo. Each subsequent step is gated on
+# `steps.gate.outputs.should-run`, which is `true` for non-PR events,
+# `true` when `code-paths` is empty, otherwise the
+# `dorny/paths-filter` boolean.
+#
+# Smoke-test stance (per Spec jcttech/trading#185 §D5): no self-test
+# fixture lives inside this repo. Story F's trading-caller refactor is the
+# end-to-end signal that catches input-surface or step-composition
+# regressions before they reach unsuspecting consumers.
+
+name: OpenAPI Drift Check
+
+on:
+  workflow_call:
+    inputs:
+      print-command:
+        type: string
+        required: true
+        description: |
+          Command run inside `working-directory` that prints the live
+          OpenAPI spec to stdout.
+          Example: `cargo run -p jtrader-server -- --print-openapi`.
+      committed-spec-path:
+        type: string
+        required: true
+        description: |
+          Path (relative to the repository root) of the committed
+          OpenAPI spec file to diff against the live output.
+      working-directory:
+        type: string
+        default: '.'
+        description: |
+          Directory in which `print-command` runs. Does NOT affect
+          resolution of `committed-spec-path`, which is always
+          repo-root-relative.
+      container-image:
+        type: string
+        default: 'ghcr.io/jcttech/devcontainer-rust-leptos:latest'
+        description: |
+          Container image for the job pod (ARC K8s mode). The default
+          carries the toolchain needed to materialise the live spec for
+          Leptos/utoipa-stack callers.
+      code-paths:
+        type: string
+        default: ''
+        description: |
+          Optional newline-separated glob list (D1 fast-lane). When set,
+          the workflow runs `dorny/paths-filter@v4` against these paths
+          on PR events; if nothing matches, every subsequent step is
+          skipped (job exits green in <30 s with no `print-command`
+          execution). Empty default = always run. Push events always
+          run regardless.
+
+jobs:
+  openapi-drift:
+    name: OpenAPI Drift
+    runs-on: github-arc-github-arc-runner-set
+    container: ${{ inputs.container-image }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Mark workspace safe
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Compute should-run from code-paths
+        id: changes
+        if: inputs.code-paths != '' && github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v4
+        with:
+          filters: |
+            relevant:
+              ${{ inputs.code-paths }}
+
+      - name: Decide should-run
+        id: gate
+        run: |
+          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+            echo "should-run=true" >> "$GITHUB_OUTPUT"
+          elif [[ -z "${{ inputs.code-paths }}" ]]; then
+            echo "should-run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should-run=${{ steps.changes.outputs.relevant }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate live OpenAPI spec
+        if: steps.gate.outputs.should-run == 'true'
+        working-directory: ${{ inputs.working-directory }}
+        run: ${{ inputs.print-command }} > /tmp/openapi.yaml.gen
+
+      - name: Diff against committed spec
+        if: steps.gate.outputs.should-run == 'true'
+        run: diff -u "${{ inputs.committed-spec-path }}" /tmp/openapi.yaml.gen
