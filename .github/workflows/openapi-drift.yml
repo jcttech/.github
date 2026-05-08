@@ -9,13 +9,13 @@
 #                                       that prints the live OpenAPI spec to
 #                                       stdout. Example:
 #                                       `cargo run -p jtrader-server -- --print-openapi`.
-#   committed-spec-path   (required) — path to the committed spec file the
-#                                       live output is diffed against
-#                                       (resolved relative to
-#                                       `working-directory`).
+#   committed-spec-path   (required) — path (relative to the repository
+#                                       root) of the committed spec file
+#                                       the live output is diffed against.
 #   working-directory     (default `.`) — directory in which `print-command`
-#                                       runs and `committed-spec-path` is
-#                                       resolved.
+#                                       runs. Does NOT affect resolution
+#                                       of `committed-spec-path`, which
+#                                       is always repo-root-relative.
 #   container-image       (default `ghcr.io/jcttech/devcontainer-rust-leptos:latest`)
 #                                     — container image for the job pod
 #                                       (ARC K8s mode).
@@ -59,14 +59,15 @@ on:
         type: string
         required: true
         description: |
-          Path (relative to `working-directory`) of the committed OpenAPI
-          spec file to diff against the live output.
+          Path (relative to the repository root) of the committed
+          OpenAPI spec file to diff against the live output.
       working-directory:
         type: string
         default: '.'
         description: |
-          Directory in which `print-command` runs and
-          `committed-spec-path` is resolved.
+          Directory in which `print-command` runs. Does NOT affect
+          resolution of `committed-spec-path`, which is always
+          repo-root-relative.
       container-image:
         type: string
         default: 'ghcr.io/jcttech/devcontainer-rust-leptos:latest'
@@ -123,5 +124,4 @@ jobs:
 
       - name: Diff against committed spec
         if: steps.gate.outputs.should-run == 'true'
-        working-directory: ${{ inputs.working-directory }}
         run: diff -u "${{ inputs.committed-spec-path }}" /tmp/openapi.yaml.gen
