@@ -1,0 +1,212 @@
+# Leptos Web Build + Size Gate — reusable workflow
+#
+# Generalises the Leptos hydrate-side build pipeline: runs a project-supplied
+# `build-command` (typically `make web-build`, which orchestrates
+# cargo-leptos + wasm-opt and enforces a gz size cap), then optionally
+# runs a `bindings-command` (OpenAPI ⇄ client drift check), an opt-in
+# `wall-script` (project-specific lint/wall gate), and an opt-in
+# WASM-size artefact upload.
+#
+# **Toolchain assumption.** This workflow does **NOT** install
+# `cargo-leptos`, `wasm-bindgen-cli`, `wasm-opt`, or the
+# `wasm32-unknown-unknown` target inline. It expects all four to already
+# be on `PATH` inside `container-image`. The default
+# `ghcr.io/jcttech/devcontainer-rust-leptos:latest` image (built from
+# `jcttech/devcontainers/rust-leptos`) bakes them in. A `container-image`
+# missing any of these will fail at the build step. See Spec
+# `jcttech/trading#185` for the rationale (closes #169 mitigation #2 —
+# bake toolchain into image, eliminate cold-runner install flakes).
+#
+# Inputs:
+#   working-directory     (default `.`) — directory in which `build-command`,
+#                                       `bindings-command`, and
+#                                       `wall-script` run.
+#   web-package           (default `web`) — Leptos hydrate-side crate name.
+#                                       Documentary today; reserved for
+#                                       future steps that need to know
+#                                       the crate name (e.g. a future
+#                                       built-in default for
+#                                       `wasm-size-artifact`). Trading
+#                                       passes `jtrader-web`.
+#   build-command         (default `make web-build`) — release build +
+#                                       size gate. Runs in
+#                                       `working-directory`.
+#   bindings-command      (default `make web-check-bindings`) — OpenAPI
+#                                       ⇄ client drift check. Runs in
+#                                       `working-directory`. Pass `''`
+#                                       to skip.
+#   wall-script           (default `''`) — opt-in path to a script that
+#                                       runs project-specific lint/wall
+#                                       gates. Resolved **inside**
+#                                       `working-directory` (i.e. a
+#                                       caller passing
+#                                       `./scripts/check-wall.sh` with
+#                                       `working-directory: jtrader`
+#                                       expects the file at
+#                                       `jtrader/scripts/check-wall.sh`).
+#                                       Pass `''` to skip.
+#   wasm-size-artifact    (default `''`) — opt-in path to a single file
+#                                       to upload via
+#                                       `actions/upload-artifact@v4`.
+#                                       Path is **repo-root-relative**
+#                                       — it does NOT inherit
+#                                       `working-directory`, because
+#                                       `actions/upload-artifact` runs
+#                                       at job level. A trading caller
+#                                       with `working-directory: jtrader`
+#                                       therefore passes
+#                                       `jtrader/target/site/pkg/jtrader_web.wasm.gz.size`,
+#                                       not `target/site/pkg/...`. Pass
+#                                       `''` to skip.
+#                                       (Lesson learned from Story C:
+#                                       any input naming a repo-rooted
+#                                       path must NOT inherit
+#                                       `working-directory`.)
+#   container-image       (default `ghcr.io/jcttech/devcontainer-rust-leptos:latest`)
+#                                     — container image for the job pod
+#                                       (ARC K8s mode). Must carry the
+#                                       Leptos toolchain on `PATH`
+#                                       (see "Toolchain assumption"
+#                                       above).
+#   code-paths            (default `''`) — D1 docs-only fast-lane filter.
+#                                       Optional newline-separated glob
+#                                       list. When set, the workflow's
+#                                       first step runs
+#                                       `dorny/paths-filter@v4` on PR
+#                                       events; if nothing matches,
+#                                       every subsequent step is skipped
+#                                       (job exits green in <30 s with
+#                                       no `build-command` execution
+#                                       in the log). Empty default =
+#                                       always run. Push events always
+#                                       run regardless of this filter.
+#
+# D1 fast-lane (per Spec jcttech/trading#185 §D1): the `code-paths:`
+# input is the standardised docs-only skip mechanism shared by the new
+# sibling reusable workflows in this repo. Each subsequent step is gated
+# on `steps.gate.outputs.should-run`, which is `true` for non-PR events,
+# `true` when `code-paths` is empty, otherwise the
+# `dorny/paths-filter` boolean.
+#
+# Smoke-test stance (per Spec jcttech/trading#185 §D5): no self-test
+# fixture lives inside this repo. Story F's trading-caller refactor is
+# the end-to-end signal that catches input-surface or step-composition
+# regressions before they reach unsuspecting consumers.
+
+name: Leptos Web Build + Size Gate
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        type: string
+        default: '.'
+        description: |
+          Directory in which `build-command`, `bindings-command`, and
+          `wall-script` run.
+      web-package:
+        type: string
+        default: 'web'
+        description: |
+          Leptos hydrate-side crate name. Documentary today; reserved
+          for future steps that need to know the crate name. Trading
+          passes `jtrader-web`.
+      build-command:
+        type: string
+        default: 'make web-build'
+        description: |
+          Release build + size-gate command. Runs in
+          `working-directory`. Default expects a `Makefile` target
+          that orchestrates cargo-leptos + wasm-opt and enforces the
+          project's gz size cap.
+      bindings-command:
+        type: string
+        default: 'make web-check-bindings'
+        description: |
+          OpenAPI ⇄ client drift-check command. Runs in
+          `working-directory`. Pass `''` to skip.
+      wall-script:
+        type: string
+        default: ''
+        description: |
+          Opt-in path to a script that runs project-specific
+          lint/wall gates. Resolved inside `working-directory`. Pass
+          `''` to skip.
+      wasm-size-artifact:
+        type: string
+        default: ''
+        description: |
+          Opt-in path to a single file to upload via
+          `actions/upload-artifact@v4`. Path is **repo-root-relative**
+          — does NOT inherit `working-directory`. Pass `''` to skip.
+      container-image:
+        type: string
+        default: 'ghcr.io/jcttech/devcontainer-rust-leptos:latest'
+        description: |
+          Container image for the job pod (ARC K8s mode). Must carry
+          `cargo-leptos`, `wasm-bindgen-cli`, `wasm-opt`, and the
+          `wasm32-unknown-unknown` target on `PATH`.
+      code-paths:
+        type: string
+        default: ''
+        description: |
+          Optional newline-separated glob list (D1 fast-lane). When
+          set, the workflow runs `dorny/paths-filter@v4` against
+          these paths on PR events; if nothing matches, every
+          subsequent step is skipped (job exits green in <30 s with
+          no `build-command` execution). Empty default = always run.
+          Push events always run regardless.
+
+jobs:
+  leptos-web-build:
+    name: Leptos Web Build
+    runs-on: github-arc-github-arc-runner-set
+    container: ${{ inputs.container-image }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Mark workspace safe
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Compute should-run from code-paths
+        id: changes
+        if: inputs.code-paths != '' && github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v4
+        with:
+          filters: |
+            relevant:
+              ${{ inputs.code-paths }}
+
+      - name: Decide should-run
+        id: gate
+        run: |
+          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+            echo "should-run=true" >> "$GITHUB_OUTPUT"
+          elif [[ -z "${{ inputs.code-paths }}" ]]; then
+            echo "should-run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should-run=${{ steps.changes.outputs.relevant }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build (release WASM + size gate)
+        if: steps.gate.outputs.should-run == 'true'
+        working-directory: ${{ inputs.working-directory }}
+        run: ${{ inputs.build-command }}
+
+      - name: Bindings drift check
+        if: steps.gate.outputs.should-run == 'true' && inputs.bindings-command != ''
+        working-directory: ${{ inputs.working-directory }}
+        run: ${{ inputs.bindings-command }}
+
+      - name: Wall stays green
+        if: steps.gate.outputs.should-run == 'true' && inputs.wall-script != ''
+        working-directory: ${{ inputs.working-directory }}
+        run: ${{ inputs.wall-script }}
+
+      - name: Upload WASM size artefact
+        if: steps.gate.outputs.should-run == 'true' && inputs.wasm-size-artifact != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-size
+          path: ${{ inputs.wasm-size-artifact }}
+          if-no-files-found: warn
