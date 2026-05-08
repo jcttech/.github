@@ -1,3 +1,90 @@
+# Rust Database Tests — reusable workflow
+#
+# Runs cargo tests against an ephemeral PostgreSQL service. Optionally
+# bootstraps the database via SQL init script(s) and, since the
+# multi-step extension, can also run a caller-supplied pre-test bash
+# script (e.g. `make schema-apply` + a sqlx migrator) and emit a schema
+# survey that is idempotently posted as a PR comment.
+#
+# Inputs:
+#   test-command         (default `'cargo test --test database_tests -- --nocapture'`)
+#                                       — command run inside the job to
+#                                       execute the database test suite.
+#   postgres-image       (default `'postgres:18'`) — Docker image used
+#                                       for the `postgres` service.
+#   rust-version         (default `'stable'`) — Rust toolchain channel
+#                                       used by the `rust-setup` action.
+#   runner               (default `'github-arc-github-arc-runner-set'`)
+#                                       — runner label for this job.
+#   container-image      (default `'ghcr.io/jcttech/devcontainer-rust:latest'`)
+#                                       — container image for the job
+#                                       pod (ARC K8s mode). Empty string
+#                                       runs directly on a GHA runner.
+#   init-sql             (default `''`) — path to an SQL init script
+#                                       run via `psql` before tests.
+#                                       Path is caller-relative.
+#   pg-host              (default `'localhost'`) — PostgreSQL service
+#                                       hostname (use `localhost` for
+#                                       ARC K8s and GHA, the service
+#                                       name for Docker-mode runners).
+#   pre-test-script      (default `''`) — path to a bash script that
+#                                       runs after `init-sql` (if any)
+#                                       and before the test step.
+#                                       Typical use: schema bootstrap
+#                                       (e.g. `make schema-apply` plus
+#                                       a sqlx migrator). Receives the
+#                                       same DB env as the test step
+#                                       (`DATABASE_URL`, `PGHOST`,
+#                                       `PGUSER`, `PGPASSWORD`,
+#                                       `PGDATABASE`). Path is
+#                                       interpreted relative to the
+#                                       CALLER's repo checkout (the
+#                                       script lives in the consuming
+#                                       repo, not in jcttech/.github).
+#   survey-script        (default `''`) — path to a bash script that
+#                                       emits a schema survey to
+#                                       stdout. Runs after
+#                                       `pre-test-script`. The captured
+#                                       output is the body of the
+#                                       comment posted by the
+#                                       `post-survey-issue` step.
+#                                       Caller-relative (same
+#                                       convention as `pre-test-script`).
+#   post-survey-issue    (default `''`) — issue or PR number to post
+#                                       the captured survey output to.
+#                                       Only fires on `pull_request`
+#                                       events and only when
+#                                       `survey-script` is also set.
+#                                       No-op if a comment containing
+#                                       `survey-marker` already exists
+#                                       on the target issue.
+#   survey-marker        (default `''`) — HTML-comment marker string
+#                                       used to detect existing survey
+#                                       comments on the target issue.
+#                                       Required when
+#                                       `post-survey-issue` is set;
+#                                       used as the first line of any
+#                                       newly-posted comment body.
+#
+# Caller-relative path resolution: `init-sql`, `pre-test-script`, and
+# `survey-script` paths are interpreted relative to the CALLER's repo
+# checkout (these files live in the consuming repo, not in
+# jcttech/.github). This is a different convention from
+# `working-directory`-style inputs on sibling reusable workflows.
+#
+# Backwards compatibility (per Spec jcttech/trading#185 §AC7): every
+# new step is `if: inputs.<name> != ''`-guarded, so existing `@v1`
+# callers that only set `init-sql` + `test-command` see zero behaviour
+# diff. The four multi-step inputs default to empty, all new steps
+# skip, and the resulting job graph is byte-identical to the prior
+# `@v1` shape.
+#
+# Smoke-test stance (per Spec jcttech/trading#185 §D5): no self-test
+# fixture lives inside this repo. Story F's trading-caller refactor
+# is the realistic end-to-end signal that catches input-surface or
+# step-composition regressions before they reach unsuspecting
+# consumers.
+
 name: Rust Database Tests
 
 on:
@@ -23,11 +110,41 @@ on:
       init-sql:
         type: string
         default: ''
-        description: 'Path to SQL init script run via psql before tests'
+        description: 'Path to SQL init script run via psql before tests (caller-relative)'
       pg-host:
         type: string
         default: 'localhost'
         description: 'PostgreSQL service hostname (localhost for ARC K8s and GHA runners, service name for Docker-mode runners)'
+      pre-test-script:
+        type: string
+        default: ''
+        description: |
+          Bash script path run after `init-sql` and before the test
+          step. Caller-relative (lives in the consuming repo).
+          Receives the same DB env as the test step.
+      survey-script:
+        type: string
+        default: ''
+        description: |
+          Bash script path that emits a schema survey to stdout.
+          Runs after `pre-test-script`. Captured output becomes the
+          body of the comment posted by `post-survey-issue`.
+          Caller-relative.
+      post-survey-issue:
+        type: string
+        default: ''
+        description: |
+          Issue/PR number to post the survey output to (only on
+          `pull_request` events, and only when `survey-script` is
+          also set). Idempotent: skipped when a comment containing
+          `survey-marker` already exists.
+      survey-marker:
+        type: string
+        default: ''
+        description: |
+          HTML-comment marker string used to detect existing survey
+          comments. Required when `post-survey-issue` is set; used
+          as the first line of any newly-posted comment body.
 
 jobs:
   database-tests:
@@ -97,6 +214,66 @@ jobs:
           PGPASSWORD: test
           PGDATABASE: test_db
         run: psql -f ${{ inputs.init-sql }}
+
+      - name: Run pre-test script
+        if: inputs.pre-test-script != ''
+        shell: bash
+        env:
+          PGHOST: ${{ env.PG_HOST }}
+          PGUSER: test
+          PGPASSWORD: test
+          PGDATABASE: test_db
+          DATABASE_URL: postgres://test:test@${{ env.PG_HOST }}:5432/test_db
+        run: bash "${{ inputs.pre-test-script }}"
+
+      - name: Run schema survey
+        if: inputs.survey-script != ''
+        shell: bash
+        env:
+          PGHOST: ${{ env.PG_HOST }}
+          PGUSER: test
+          PGPASSWORD: test
+          PGDATABASE: test_db
+          DATABASE_URL: postgres://test:test@${{ env.PG_HOST }}:5432/test_db
+        run: bash "${{ inputs.survey-script }}" | tee /tmp/schema-survey.txt
+
+      - name: Post survey to PR (idempotent)
+        if: >-
+          inputs.post-survey-issue != '' &&
+          inputs.survey-script != '' &&
+          github.event_name == 'pull_request'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ inputs.post-survey-issue }}
+          MARKER: ${{ inputs.survey-marker }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ -z "$MARKER" ]; then
+            echo "::error::survey-marker is required when post-survey-issue is set"
+            exit 1
+          fi
+          if [ ! -f /tmp/schema-survey.txt ]; then
+            echo "::warning::No schema-survey output found at /tmp/schema-survey.txt; skipping comment post"
+            exit 0
+          fi
+          # Idempotency: skip if any existing comment on the target
+          # issue already contains the marker substring.
+          if gh api --paginate \
+              "repos/${REPO}/issues/${ISSUE}/comments" \
+              --jq '.[].body' \
+              | grep -F -q -- "$MARKER"; then
+            echo "Survey marker already present on issue #${ISSUE}; skipping comment post."
+            exit 0
+          fi
+          {
+            printf '%s\n\n' "$MARKER"
+            cat /tmp/schema-survey.txt
+          } > /tmp/schema-survey-comment.md
+          gh issue comment "${ISSUE}" \
+            --repo "${REPO}" \
+            --body-file /tmp/schema-survey-comment.md
+          echo "Posted survey comment to issue #${ISSUE}."
 
       - name: Run database tests
         env:
