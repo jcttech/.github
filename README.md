@@ -255,7 +255,7 @@ JCT TECH reusable workflows accept an optional `code-paths:` input that gates th
 | `rust-pipeline.yml` | yes (since pre-existing) |
 | `openapi-drift.yml` | yes |
 | `leptos-web-build.yml` | yes |
-| `rust-database-tests.yml` | yes — opt-in once `@v2` is cut (Spec [jcttech/trading#185](https://github.com/jcttech/trading/issues/185) Story B) |
+| `rust-database-tests.yml` | no — planned as a future additive change to `@v1` (the multi-step inputs from Spec [jcttech/trading#185](https://github.com/jcttech/trading/issues/185) Story B landed on `@v1`; the `code-paths:` fast-lane was deliberately deferred to keep that diff minimal) |
 
 **Reference scaffolding:** see `.github/workflows/openapi-drift.yml` for the canonical implementation. The two-step gate (`Compute should-run from code-paths` → `Decide should-run`) is intentionally byte-identical across siblings so callers and reviewers can recognise the pattern at a glance.
 
@@ -266,7 +266,7 @@ JCT TECH reusable workflows accept an optional `code-paths:` input that gates th
 ```yaml
 jobs:
   web-build:
-    uses: jcttech/.github/.github/workflows/leptos-web-build.yml@v2
+    uses: jcttech/.github/.github/workflows/leptos-web-build.yml@v1
     with:
       working-directory: jtrader
       web-package: jtrader-web
@@ -282,20 +282,23 @@ A PR that touches only `.docs/**` sees `web-build` exit green in <30 s. A PR tou
 
 ### Versioning
 
-This repo uses two long-lived tags consumers can pin to:
+This repo uses a **single major-rolling tag** convention. Consumers normally pin to `@v1`; downstream callers needing immutable behaviour across rolling updates use commit-SHA pins.
 
 | Tag | Tip points at |
 |---|---|
-| `@v1` | the latest commit considered backwards-compatible with the original `@v1` API. Force-moved forward as additive sibling workflows land. |
-| `@v2` | (cut once Spec [jcttech/trading#185](https://github.com/jcttech/trading/issues/185) Story B's `rust-database-tests.yml` extension lands) the recognisable opt-in moment for the multi-step `rust-database-tests.yml` capability. |
+| `@v1` | the latest commit on `main` considered backwards-compatible with the original `@v1` API. Force-moved forward as additive sibling workflows and additive optional inputs land. |
 
-**`@v1 → @v2` is zero-diff for existing callers.** All new inputs added in the `@v2`-cut series are guarded with `if: inputs.<name> != ''` and default to the empty/no-op state, so a caller pinned to `@v1` (`init-sql:` + `test-command:` only on `rust-database-tests.yml`, for example) sees identical behaviour after switching the pin to `@v2`. The `@v2` tag exists primarily as a recognisable opt-in moment, not a breaking change.
+**Why a single rolling tag (rather than cutting `@v2` for every additive opt-in moment)?**
+
+Every change that has landed on these reusable workflows so far has been backwards-compatible — net-new sibling workflow files (e.g. `openapi-drift.yml`, `leptos-web-build.yml`), or new optional inputs guarded by `if: inputs.<name> != ''`. None of them break a caller that doesn't opt in. Cutting a new tag for each additive change creates a maintenance treadmill (every consumer eventually has to bump pins for behaviour they don't use) without buying any genuine isolation benefit.
+
+`@v1` therefore force-moves forward whenever an additive change lands. A future `@v2` is reserved for a *real* breaking change — a removed input, a renamed step output, a changed default, or an incompatible behaviour shift. Until that day, `@v1` is the only contract worth pinning to, and consumers needing snapshot stability use commit SHAs.
 
 **Operations:**
 
-- **Force-moving `@v1` forward** — used when a sibling workflow is added that doesn't touch any existing file. Existing callers don't reference the new files, so the move is invisible to them and unlocks the new sibling for `@v1`-pinned consumers who choose to adopt it. Run `git tag -f -a v1 -m "..." && git push --force origin v1`.
-- **Cutting a new `@vN`** — used when a substantive opt-in capability lands (e.g. multi-step DB-tests). Run `git tag -a vN -m "..." && git push origin vN`. The new tag points at the same commit as the moved-forward `@v(N-1)` at the moment of the cut; they diverge as further changes accumulate.
-- **Don't accumulate diverging changes between operations.** If something else lands on `main` between a force-move and the next tag cut, re-do the force-move first so both tags stay aligned at the same commit.
+- **Force-moving `@v1` forward** (the default for any additive change) — used when a sibling workflow is added, or when an existing workflow gains a new optional input. Existing callers don't reference the new files / inputs, so the move is invisible to them and unlocks the new capability for `@v1`-pinned consumers who choose to adopt it. Run `git tag -f -a v1 -m "..." && git push --force origin v1`.
+- **Commit-SHA pinning** (the escape hatch for callers needing immutability) — when a downstream caller needs guaranteed-stable behaviour across rolling `@v1` updates (e.g. a long-lived release branch, a reproducibility-sensitive build), pin to a specific commit SHA: `uses: jcttech/.github/.github/workflows/<workflow>.yml@<full-sha>`. This bypasses the rolling-major contract entirely and is the documented alternative to per-feature opt-in tags.
+- **Cutting `@v2` (or higher)** — reserved for a true breaking change. Run `git tag -a v2 -m "..." && git push origin v2` at the SHA that introduces the break. At that moment `@v2` and `@v1` diverge; `@v1` either stays at the prior commit or is retired depending on the migration story for that release.
 
 ### Permissions
 
