@@ -97,14 +97,22 @@ jobs:
       - name: Mark workspace safe
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
+      - name: Build paths-filter input
+        id: build-filter
+        if: inputs.code-paths != '' && github.event_name == 'pull_request'
+        run: |
+          PATHS=$(echo "${{ inputs.code-paths }}" | sed '/^$/d' | sed 's/^/      - /')
+          echo "filters<<EOF" >> "$GITHUB_OUTPUT"
+          echo "relevant:" >> "$GITHUB_OUTPUT"
+          echo "$PATHS" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
       - name: Compute should-run from code-paths
         id: changes
         if: inputs.code-paths != '' && github.event_name == 'pull_request'
         uses: dorny/paths-filter@v4
         with:
-          filters: |
-            relevant:
-              ${{ inputs.code-paths }}
+          filters: ${{ steps.build-filter.outputs.filters }}
 
       - name: Decide should-run
         id: gate
