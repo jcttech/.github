@@ -255,7 +255,7 @@ JCT TECH reusable workflows accept an optional `code-paths:` input that gates th
 | `rust-pipeline.yml` | yes (since pre-existing) |
 | `openapi-drift.yml` | yes |
 | `leptos-web-build.yml` | yes |
-| `rust-database-tests.yml` | no — planned as a future additive change to `@v1` (the multi-step inputs from Spec [jcttech/trading#185](https://github.com/jcttech/trading/issues/185) Story B landed on `@v1`; the `code-paths:` fast-lane was deliberately deferred to keep that diff minimal) |
+| `rust-database-tests.yml` | yes (added in follow-up to Spec [jcttech/trading#185](https://github.com/jcttech/trading/issues/185) — see `jcttech/trading#195`; closes the §D1 fast-lane gap noted at end of Story G) |
 
 **Reference scaffolding:** see `.github/workflows/openapi-drift.yml` for the canonical implementation. The two-step gate (`Compute should-run from code-paths` → `Decide should-run`) is intentionally byte-identical across siblings so callers and reviewers can recognise the pattern at a glance.
 
