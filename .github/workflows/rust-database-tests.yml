@@ -79,6 +79,17 @@
 # skip, and the resulting job graph is byte-identical to the prior
 # `@v1` shape.
 #
+# D1 fast-lane (per Spec jcttech/trading#185 §D1): the optional
+# `code-paths:` input is the standardised docs-only skip mechanism
+# shared by the sibling reusable workflows in this repo
+# (`openapi-drift.yml`, `leptos-web-build.yml`). When set, the
+# workflow's first sub-step runs `dorny/paths-filter@v4` on PR events;
+# if nothing matches, every subsequent step is skipped (job exits
+# green in <30 s with no test/build execution in the log). Empty
+# default = always run, which preserves byte-identical behaviour for
+# existing `@v1` callers that don't opt in. Push events always run
+# regardless of this filter (matches sibling-workflow semantics).
+#
 # Smoke-test stance (per Spec jcttech/trading#185 §D5): no self-test
 # fixture lives inside this repo. Story F's trading-caller refactor
 # is the realistic end-to-end signal that catches input-surface or
@@ -145,6 +156,17 @@ on:
           HTML-comment marker string used to detect existing survey
           comments. Required when `post-survey-issue` is set; used
           as the first line of any newly-posted comment body.
+      code-paths:
+        type: string
+        default: ''
+        description: |
+          Optional newline-separated glob list (D1 fast-lane). When
+          set, the workflow runs `dorny/paths-filter@v4` against
+          these paths on PR events; if nothing matches, every
+          subsequent step is skipped (job exits green in <30 s with
+          no test/build execution). Empty default = always run.
+          Push events always run regardless. Mirrors the same input
+          on `openapi-drift.yml` and `leptos-web-build.yml`.
 
 jobs:
   database-tests:
@@ -171,12 +193,42 @@ jobs:
       - name: Mark workspace safe
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
+      - name: Build paths-filter input
+        id: build-filter
+        if: inputs.code-paths != '' && github.event_name == 'pull_request'
+        run: |
+          PATHS=$(echo "${{ inputs.code-paths }}" | sed '/^$/d' | sed 's/^/      - /')
+          echo "filters<<EOF" >> "$GITHUB_OUTPUT"
+          echo "relevant:" >> "$GITHUB_OUTPUT"
+          echo "$PATHS" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Compute should-run from code-paths
+        id: changes
+        if: inputs.code-paths != '' && github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v4
+        with:
+          filters: ${{ steps.build-filter.outputs.filters }}
+
+      - name: Decide should-run
+        id: gate
+        run: |
+          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+            echo "should-run=true" >> "$GITHUB_OUTPUT"
+          elif [[ -z "${{ inputs.code-paths }}" ]]; then
+            echo "should-run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should-run=${{ steps.changes.outputs.relevant }}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Setup Rust
+        if: steps.gate.outputs.should-run == 'true'
         uses: jcttech/.github/.github/actions/rust-setup@v1
         with:
           rust-version: ${{ inputs.rust-version }}
 
       - name: Configure cargo for private git deps
+        if: steps.gate.outputs.should-run == 'true'
         env:
           PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
         run: |
@@ -189,7 +241,7 @@ jobs:
           echo "Configured private git auth via PRIVATE_REPO_TOKEN for cargo fetch"
 
       - name: Install PostgreSQL client
-        if: inputs.init-sql != ''
+        if: steps.gate.outputs.should-run == 'true' && inputs.init-sql != ''
         shell: bash
         run: |
           if ! command -v psql >/dev/null 2>&1; then
@@ -207,7 +259,7 @@ jobs:
           psql --version
 
       - name: Initialize database
-        if: inputs.init-sql != ''
+        if: steps.gate.outputs.should-run == 'true' && inputs.init-sql != ''
         env:
           PGHOST: ${{ env.PG_HOST }}
           PGUSER: test
@@ -216,7 +268,7 @@ jobs:
         run: psql -f ${{ inputs.init-sql }}
 
       - name: Run pre-test script
-        if: inputs.pre-test-script != ''
+        if: steps.gate.outputs.should-run == 'true' && inputs.pre-test-script != ''
         shell: bash
         env:
           PGHOST: ${{ env.PG_HOST }}
@@ -227,7 +279,7 @@ jobs:
         run: bash "${{ inputs.pre-test-script }}"
 
       - name: Run schema survey
-        if: inputs.survey-script != ''
+        if: steps.gate.outputs.should-run == 'true' && inputs.survey-script != ''
         shell: bash
         env:
           PGHOST: ${{ env.PG_HOST }}
@@ -239,6 +291,7 @@ jobs:
 
       - name: Post survey to PR (idempotent)
         if: >-
+          steps.gate.outputs.should-run == 'true' &&
           inputs.post-survey-issue != '' &&
           inputs.survey-script != '' &&
           github.event_name == 'pull_request'
@@ -276,6 +329,7 @@ jobs:
           echo "Posted survey comment to issue #${ISSUE}."
 
       - name: Run database tests
+        if: steps.gate.outputs.should-run == 'true'
         env:
           DATABASE_URL: postgres://test:test@${{ env.PG_HOST }}:5432/test_db
         run: ${{ inputs.test-command }}
