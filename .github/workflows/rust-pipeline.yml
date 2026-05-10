@@ -1,3 +1,34 @@
+# Rust Pipeline — reusable workflow
+#
+# Aggregates change detection, build/clippy/test, optional sibling
+# workflows (database-tests, openapi-drift, leptos-web-build, rust-docs),
+# Docker image build/push, and tagged GitHub releases under one caller-
+# friendly entry point. Each sibling is opt-in via an `enable-*` flag
+# (default `false` for the new sub-jobs, default `true` for build/docker/
+# release to preserve the original `@v1` contract). Pass-through inputs
+# for each sibling are prefixed `<sub-job>-*` so callers can configure
+# them without colliding on shared names like `code-paths` or
+# `container-image`.
+#
+# `serialize-jobs:` toggle (per Spec jcttech/trading#185 follow-up): when
+# `true`, the chain `database-tests → openapi-drift → web-build` runs
+# fail-fast — a chain link only proceeds if the previous link reported
+# `success` or was skipped (a failure cascades into a skip on the next
+# link, mirroring the in-repo `needs:` chain that landed on trading's
+# main as the immediate fix for ARC OOM under PR #197). When `false`
+# (the default), failures don't cascade between chain links: each enabled
+# link runs independently. The wall-clock `needs:` chain is static —
+# GitHub Actions doesn't support dynamic `needs:`, so non-serial mode
+# still waits for the previous link to finish before starting the next;
+# the toggle controls failure propagation, not literal parallelism.
+# `docker` and `release` keep their pre-existing `!failure() &&
+# !cancelled()` semantics — failure of any chain link still blocks the
+# image push and the release artifact upload.
+#
+# Backwards compatibility: every new input defaults to `false` (booleans)
+# or `''` (strings); existing `@v1` callers that only wire up
+# `enable-database-tests` see byte-identical job graphs and execution.
+
 name: Rust Pipeline
 
 on:
@@ -50,6 +81,155 @@ on:
         type: string
         default: ''
         description: 'Path to SQL init script run via psql before database tests'
+      database-tests-pre-test-script:
+        type: string
+        default: ''
+        description: |
+          Bash script path forwarded to `rust-database-tests.yml` as
+          `pre-test-script`. Caller-relative (lives in the consuming
+          repo). Receives the same DB env as the test step.
+      database-tests-survey-script:
+        type: string
+        default: ''
+        description: |
+          Bash script path forwarded to `rust-database-tests.yml` as
+          `survey-script`. Captured stdout becomes the body of the
+          comment posted via `database-tests-post-survey-issue`.
+      database-tests-post-survey-issue:
+        type: string
+        default: ''
+        description: |
+          Issue/PR number forwarded to `rust-database-tests.yml` as
+          `post-survey-issue` (idempotent comment post; see that
+          workflow's docs for the marker contract).
+      database-tests-survey-marker:
+        type: string
+        default: ''
+        description: |
+          HTML-comment marker string forwarded to `rust-database-tests.yml`
+          as `survey-marker`. Required when
+          `database-tests-post-survey-issue` is set.
+      database-tests-code-paths:
+        type: string
+        default: ''
+        description: |
+          Newline-separated glob list forwarded to `rust-database-tests.yml`
+          as `code-paths` (D1 fast-lane). Empty default = always run.
+      enable-openapi-drift:
+        type: boolean
+        default: false
+        description: |
+          Opt into the OpenAPI drift-detection sub-job. When `true`,
+          `openapi-drift-print-command` and
+          `openapi-drift-committed-spec-path` MUST also be set (those
+          inputs are required on the underlying reusable workflow).
+      openapi-drift-print-command:
+        type: string
+        default: ''
+        description: |
+          Forwarded to `openapi-drift.yml` as `print-command`. Command
+          run inside `openapi-drift-working-directory` that prints the
+          live OpenAPI spec to stdout (e.g.
+          `cargo run -p server -- --print-openapi`). Required when
+          `enable-openapi-drift` is `true`.
+      openapi-drift-committed-spec-path:
+        type: string
+        default: ''
+        description: |
+          Forwarded to `openapi-drift.yml` as `committed-spec-path`.
+          Repo-root-relative path of the committed OpenAPI spec to
+          diff the live output against. Required when
+          `enable-openapi-drift` is `true`.
+      openapi-drift-working-directory:
+        type: string
+        default: '.'
+        description: |
+          Forwarded to `openapi-drift.yml` as `working-directory`.
+          Directory in which `openapi-drift-print-command` runs.
+      openapi-drift-container-image:
+        type: string
+        default: 'ghcr.io/jcttech/devcontainer-rust-leptos:latest'
+        description: |
+          Forwarded to `openapi-drift.yml` as `container-image`.
+          Container image for the openapi-drift job pod.
+      openapi-drift-code-paths:
+        type: string
+        default: ''
+        description: |
+          Newline-separated glob list forwarded to `openapi-drift.yml`
+          as `code-paths` (D1 fast-lane). Empty default = always run.
+      enable-web-build:
+        type: boolean
+        default: false
+        description: |
+          Opt into the Leptos web-build + size-gate sub-job.
+      web-build-working-directory:
+        type: string
+        default: '.'
+        description: |
+          Forwarded to `leptos-web-build.yml` as `working-directory`.
+      web-build-web-package:
+        type: string
+        default: 'web'
+        description: |
+          Forwarded to `leptos-web-build.yml` as `web-package`. Leptos
+          hydrate-side crate name (e.g. `jtrader-web`).
+      web-build-build-command:
+        type: string
+        default: 'make web-build'
+        description: |
+          Forwarded to `leptos-web-build.yml` as `build-command`.
+          Release build + size-gate command run in
+          `web-build-working-directory`.
+      web-build-bindings-command:
+        type: string
+        default: 'make web-check-bindings'
+        description: |
+          Forwarded to `leptos-web-build.yml` as `bindings-command`.
+          OpenAPI ⇄ client drift-check command. Pass `''` to skip.
+      web-build-wall-script:
+        type: string
+        default: ''
+        description: |
+          Forwarded to `leptos-web-build.yml` as `wall-script`. Opt-in
+          path to a project-specific lint/wall gate script. Pass `''`
+          to skip.
+      web-build-wasm-size-artifact:
+        type: string
+        default: ''
+        description: |
+          Forwarded to `leptos-web-build.yml` as `wasm-size-artifact`.
+          Repo-root-relative path of a single file uploaded as an
+          artefact. Pass `''` to skip.
+      web-build-container-image:
+        type: string
+        default: 'ghcr.io/jcttech/devcontainer-rust-leptos:latest'
+        description: |
+          Forwarded to `leptos-web-build.yml` as `container-image`.
+          Must carry cargo-leptos / wasm-bindgen-cli / wasm-opt /
+          wasm32-unknown-unknown on `PATH`.
+      web-build-code-paths:
+        type: string
+        default: ''
+        description: |
+          Newline-separated glob list forwarded to `leptos-web-build.yml`
+          as `code-paths` (D1 fast-lane). Empty default = always run.
+      serialize-jobs:
+        type: boolean
+        default: false
+        description: |
+          When `true`, the chain `database-tests → openapi-drift →
+          web-build` runs fail-fast: each chain link only proceeds if
+          the previous link reported `success` or was skipped (failure
+          cascades). When `false` (the default), failures don't cascade
+          between chain links — each enabled link runs independently.
+          The `needs:` chain itself is static (GitHub Actions doesn't
+          support dynamic `needs:`), so non-serial mode still waits for
+          the previous link to finish before starting; the flag
+          controls failure propagation, not literal parallelism.
+          `docker` and `release` always cascade failures from any chain
+          link via their pre-existing `!failure()` semantics, regardless
+          of this flag.
       tag-prefix:
         type: string
         default: ''
@@ -191,6 +371,54 @@ jobs:
       runner: ${{ inputs.runner }}
       container-image: ${{ inputs.container-image }}
       init-sql: ${{ inputs.init-sql }}
+      pre-test-script: ${{ inputs.database-tests-pre-test-script }}
+      survey-script: ${{ inputs.database-tests-survey-script }}
+      post-survey-issue: ${{ inputs.database-tests-post-survey-issue }}
+      survey-marker: ${{ inputs.database-tests-survey-marker }}
+      code-paths: ${{ inputs.database-tests-code-paths }}
+
+  openapi-drift:
+    needs: [changes, database-tests]
+    if: >-
+      !cancelled() &&
+      inputs.enable-openapi-drift &&
+      (!inputs.serialize-jobs ||
+        needs.database-tests.result == 'success' ||
+        needs.database-tests.result == 'skipped') &&
+      (startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix)) ||
+      github.event_name == 'pull_request' ||
+      needs.changes.outputs.code == 'true')
+    uses: jcttech/.github/.github/workflows/openapi-drift.yml@v1
+    secrets: inherit
+    with:
+      print-command: ${{ inputs.openapi-drift-print-command }}
+      committed-spec-path: ${{ inputs.openapi-drift-committed-spec-path }}
+      working-directory: ${{ inputs.openapi-drift-working-directory }}
+      container-image: ${{ inputs.openapi-drift-container-image }}
+      code-paths: ${{ inputs.openapi-drift-code-paths }}
+
+  web-build:
+    needs: [changes, openapi-drift]
+    if: >-
+      !cancelled() &&
+      inputs.enable-web-build &&
+      (!inputs.serialize-jobs ||
+        needs.openapi-drift.result == 'success' ||
+        needs.openapi-drift.result == 'skipped') &&
+      (startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix)) ||
+      github.event_name == 'pull_request' ||
+      needs.changes.outputs.code == 'true')
+    uses: jcttech/.github/.github/workflows/leptos-web-build.yml@v1
+    secrets: inherit
+    with:
+      working-directory: ${{ inputs.web-build-working-directory }}
+      web-package: ${{ inputs.web-build-web-package }}
+      build-command: ${{ inputs.web-build-build-command }}
+      bindings-command: ${{ inputs.web-build-bindings-command }}
+      wall-script: ${{ inputs.web-build-wall-script }}
+      wasm-size-artifact: ${{ inputs.web-build-wasm-size-artifact }}
+      container-image: ${{ inputs.web-build-container-image }}
+      code-paths: ${{ inputs.web-build-code-paths }}
 
   docs:
     needs: changes
@@ -208,7 +436,7 @@ jobs:
       container-image: ${{ inputs.container-image }}
 
   docker:
-    needs: [changes, build, database-tests]
+    needs: [changes, build, database-tests, openapi-drift, web-build]
     if: >-
       !failure() && !cancelled() &&
       inputs.enable-docker &&
@@ -263,7 +491,7 @@ jobs:
           tag-prefix: ${{ inputs.tag-prefix }}
 
   release:
-    needs: [build, docker, database-tests]
+    needs: [build, docker, database-tests, openapi-drift, web-build]
     if: >-
       !failure() && !cancelled() &&
       inputs.enable-release &&
