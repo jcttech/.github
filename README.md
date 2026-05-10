@@ -54,15 +54,61 @@ jobs:
 
 #### `rust-pipeline.yml`
 
-Complete CI/CD for Rust projects: change detection, build, clippy, test, Docker, and releases.
+Complete CI/CD for Rust projects: change detection, build, clippy, test, Docker, and releases. Optionally folds in three sibling reusable workflows as opt-in sub-jobs (`database-tests`, `openapi-drift`, `web-build`) so a single `uses:` call can replace several standalone jobs in a consumer's `ci.yml`.
 
-**Inputs:**
+**Top-level inputs:**
+
 | Input | Type | Default | Description |
 |-------|------|---------|-------------|
 | `code-paths` | string | src/**, Cargo.*, Dockerfile, tests/** | Newline-separated glob patterns for code files |
 | `rust-version` | string | `stable` | Rust toolchain version |
+| `enable-build` | boolean | `true` | Run build, clippy, and test job |
 | `enable-docker` | boolean | `true` | Build and push Docker image |
 | `enable-release` | boolean | `true` | Create GitHub release on tags |
+| `enable-docs` | boolean | `false` | Generate rustdoc and documentation coverage |
+| `enable-rustdoc` | boolean | `true` | When `enable-docs` is true, also generate rustdoc HTML |
+| `serialize-jobs` | boolean | `false` | Fail-fast cascading between `database-tests → openapi-drift → web-build` chain links. When `false`, failures don't cascade between chain links. The `needs:` chain itself is always static (GitHub Actions doesn't support dynamic `needs:`); this flag controls failure propagation, not literal parallelism. `docker` and `release` always cascade chain-link failures via `!failure()`. |
+| `runner` | string | `github-arc-github-arc-runner-set` | Runner label for build/test jobs |
+| `container-image` | string | `ghcr.io/jcttech/devcontainer-rust:latest` | Container image for build/docker/release pods (empty string for non-ARC GHA runners) |
+
+**Database-tests sub-job (forwards to `rust-database-tests.yml`):**
+
+| Input | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enable-database-tests` | boolean | `false` | Opt into the database-tests sub-job |
+| `database-test-command` | string | `cargo test --test database_tests -- --nocapture` | Forwarded as `test-command` |
+| `postgres-image` | string | `postgres:18` | PostgreSQL service image |
+| `init-sql` | string | `''` | Path to SQL init script run via psql before tests |
+| `database-tests-pre-test-script` | string | `''` | Caller-relative bash script (e.g. `make schema-apply` + sqlx migrator), forwarded as `pre-test-script` |
+| `database-tests-survey-script` | string | `''` | Caller-relative bash script that emits a schema survey to stdout, forwarded as `survey-script` |
+| `database-tests-post-survey-issue` | string | `''` | Issue/PR number for idempotent survey-comment posting, forwarded as `post-survey-issue` |
+| `database-tests-survey-marker` | string | `''` | HTML-comment marker for the survey-comment idempotency check, forwarded as `survey-marker` |
+| `database-tests-code-paths` | string | `''` | D1 fast-lane glob list, forwarded as `code-paths` |
+
+**OpenAPI-drift sub-job (forwards to `openapi-drift.yml`):**
+
+| Input | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enable-openapi-drift` | boolean | `false` | Opt into the OpenAPI drift sub-job |
+| `openapi-drift-print-command` | string | `''` | Required when enabled — command run inside `openapi-drift-working-directory` that prints the live OpenAPI spec to stdout |
+| `openapi-drift-committed-spec-path` | string | `''` | Required when enabled — repo-root-relative path to the committed spec |
+| `openapi-drift-working-directory` | string | `.` | Directory in which `openapi-drift-print-command` runs |
+| `openapi-drift-container-image` | string | `ghcr.io/jcttech/devcontainer-rust-leptos:latest` | Container image for the openapi-drift job pod |
+| `openapi-drift-code-paths` | string | `''` | D1 fast-lane glob list |
+
+**Web-build sub-job (forwards to `leptos-web-build.yml`):**
+
+| Input | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enable-web-build` | boolean | `false` | Opt into the Leptos web-build + size-gate sub-job |
+| `web-build-working-directory` | string | `.` | Directory in which build/bindings/wall commands run |
+| `web-build-web-package` | string | `web` | Leptos hydrate-side crate name (e.g. `jtrader-web`) |
+| `web-build-build-command` | string | `make web-build` | Release build + size-gate command |
+| `web-build-bindings-command` | string | `make web-check-bindings` | OpenAPI ⇄ client drift-check command (pass `''` to skip) |
+| `web-build-wall-script` | string | `''` | Opt-in path to a project-specific lint/wall gate script |
+| `web-build-wasm-size-artifact` | string | `''` | Repo-root-relative path of a single file to upload as the `wasm-size` artefact |
+| `web-build-container-image` | string | `ghcr.io/jcttech/devcontainer-rust-leptos:latest` | Container image for the web-build job pod (must carry the WASM toolchain) |
+| `web-build-code-paths` | string | `''` | D1 fast-lane glob list |
 
 **Example with custom options:**
 ```yaml
@@ -79,6 +125,42 @@ jobs:
       contents: write
       packages: write
     secrets: inherit
+```
+
+**Example folding three sibling jobs into one call (Leptos + DB + OpenAPI):**
+```yaml
+jobs:
+  ci:
+    uses: jcttech/.github/.github/workflows/rust-pipeline.yml@v1
+    permissions:
+      contents: write
+      packages: write
+      issues: write       # for database-tests survey-comment posting
+    secrets: inherit
+    with:
+      enable-build: false
+      enable-docker: false
+      enable-release: false
+      serialize-jobs: true   # fail-fast cascading on ARC OOM-prone runners
+
+      enable-database-tests: true
+      container-image: ghcr.io/jcttech/devcontainer-rust-leptos:latest
+      database-tests-pre-test-script: ./scripts/ci/db-pretest.sh
+      database-tests-survey-script: ./scripts/survey-schema.sh
+      database-tests-post-survey-issue: '18'
+      database-tests-survey-marker: '<!-- schema-survey -->'
+      database-test-command: cargo test --workspace
+
+      enable-openapi-drift: true
+      openapi-drift-working-directory: app
+      openapi-drift-print-command: cargo run -p server -- --print-openapi
+      openapi-drift-committed-spec-path: .docs/openapi.yaml
+
+      enable-web-build: true
+      web-build-working-directory: app
+      web-build-web-package: app-web
+      web-build-wall-script: ./scripts/check-wall.sh
+      web-build-wasm-size-artifact: app/target/site/pkg/app_web.wasm.gz.size
 ```
 
 #### `python-pipeline.yml`
@@ -252,7 +334,7 @@ JCT TECH reusable workflows accept an optional `code-paths:` input that gates th
 
 | Workflow | `code-paths:` support |
 |---|---|
-| `rust-pipeline.yml` | yes (since pre-existing) |
+| `rust-pipeline.yml` | yes (top-level `code-paths` gates `build`/`docker`/`release`; the `database-tests`, `openapi-drift`, and `web-build` sub-jobs each accept their own `<sub-job>-code-paths` that's forwarded to the underlying sibling) |
 | `openapi-drift.yml` | yes |
 | `leptos-web-build.yml` | yes |
 | `rust-database-tests.yml` | yes (added in follow-up to Spec [jcttech/trading#185](https://github.com/jcttech/trading/issues/185) — see `jcttech/trading#195`; closes the §D1 fast-lane gap noted at end of Story G) |
