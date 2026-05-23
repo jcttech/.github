@@ -74,7 +74,7 @@ runs:
 
     - name: Set up Docker Buildx
       if: steps.check.outputs.exists != 'true' && steps.detect.outputs.builder == 'docker'
-      uses: docker/setup-buildx-action@v3
+      uses: docker/setup-buildx-action@v4
 
     - name: Compute clean version
       if: startsWith(github.ref, 'refs/tags/')
@@ -87,7 +87,7 @@ runs:
 
     - name: Extract metadata
       id: meta
-      uses: docker/metadata-action@v5
+      uses: docker/metadata-action@v6
       with:
         images: ${{ inputs.registry }}/${{ steps.image-ref.outputs.name }}
         tags: |
@@ -99,7 +99,7 @@ runs:
 
     - name: Build and push (Docker)
       if: steps.check.outputs.exists != 'true' && inputs.push == 'true' && steps.detect.outputs.builder == 'docker'
-      uses: docker/build-push-action@v6
+      uses: docker/build-push-action@v7
       with:
         context: .
         file: ${{ inputs.dockerfile }}
