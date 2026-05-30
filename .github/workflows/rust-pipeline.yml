@@ -258,6 +258,16 @@ on:
         type: string
         default: 'ghcr.io/jcttech/devcontainer-rust:latest'
         description: 'Container image for job pods (required for ARC K8s mode, empty string for GHA runners)'
+      sccache-recache:
+        type: boolean
+        default: false
+        description: |
+          When `true`, sets `SCCACHE_RECACHE=true` on the build job so
+          rustc compilations bypass existing sccache entries and write
+          fresh objects. Use to recover from poisoned cache on a
+          persistent self-hosted `SCCACHE_DIR` (e.g. ICE / SIGSEGV
+          from stale rustc objects after a toolchain bump). One-shot:
+          flip back to `false` once the cache has been rewritten.
 
 jobs:
   changes:
@@ -331,6 +341,10 @@ jobs:
           PREFIX="${{ inputs.tag-prefix }}"
           VERSION="${TAG#${PREFIX}v}"
           echo "APP_VERSION=${VERSION}" >> $GITHUB_ENV
+
+      - name: Enable sccache recache
+        if: inputs.sccache-recache
+        run: echo "SCCACHE_RECACHE=true" >> "$GITHUB_ENV"
 
       - name: Build
         run: cargo build --release
