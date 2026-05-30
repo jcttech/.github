@@ -502,6 +502,23 @@ jobs:
           if [ ! -e /dev/fuse ]; then
             echo "::warning::/dev/fuse not present — fuse-overlayfs will fail; pod template needs to expose it"
           fi
+          echo "--- diagnose: /dev/fuse perms ---"
+          ls -lLZ /dev/fuse 2>&1 || true
+          stat /dev/fuse 2>&1 || true
+          echo "--- diagnose: try open /dev/fuse rw ---"
+          (exec 3<> /dev/fuse) 2>&1 && echo "open OK" || echo "open FAILED"
+          echo "--- diagnose: effective caps ---"
+          grep -E 'Cap(Inh|Prm|Eff|Bnd)' /proc/self/status 2>&1 || true
+          command -v capsh >/dev/null && capsh --decode=$(awk '/^CapEff:/{print $2}' /proc/self/status) 2>&1 || echo "capsh not available"
+          echo "--- diagnose: AppArmor / SELinux ---"
+          cat /proc/self/attr/current 2>&1 || true
+          cat /sys/kernel/security/apparmor/profiles 2>/dev/null | head -3 || true
+          getenforce 2>/dev/null || true
+          echo "--- diagnose: /dev mount source ---"
+          findmnt /dev 2>&1 || true
+          findmnt /dev/fuse 2>&1 || true
+          mount | grep -E '/dev' | head -10
+          echo "--- end diagnose ---"
           mkdir -p "$HOME/.config/containers"
           cat > "$HOME/.config/containers/storage.conf" <<'EOF'
           [storage]
