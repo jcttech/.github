@@ -492,6 +492,25 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Configure podman storage (rootless overlay via fuse-overlayfs)
+        if: inputs.container-image != ''
+        run: |
+          # Rootless podman in an unprivileged container can't mount real
+          # overlayfs. Force the userspace fuse-overlayfs helper so
+          # overlay works without CAP_SYS_ADMIN. Requires /dev/fuse
+          # exposed by the runner pod template.
+          if [ ! -e /dev/fuse ]; then
+            echo "::warning::/dev/fuse not present — fuse-overlayfs will fail; pod template needs to expose it"
+          fi
+          mkdir -p "$HOME/.config/containers"
+          cat > "$HOME/.config/containers/storage.conf" <<'EOF'
+          [storage]
+          driver = "overlay"
+
+          [storage.options]
+          mount_program = "/usr/bin/fuse-overlayfs"
+          EOF
+
       - name: Login to registry (Podman)
         if: inputs.container-image != ''
         run: podman login ghcr.io -u "${{ github.actor }}" -p "${{ secrets.GITHUB_TOKEN }}"
