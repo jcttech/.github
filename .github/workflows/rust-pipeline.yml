@@ -1,33 +1,39 @@
-# Rust Pipeline — reusable workflow
+# Rust Pipeline — reusable workflow (@v2)
 #
 # Aggregates change detection, build/clippy/test, optional sibling
-# workflows (database-tests, openapi-drift, leptos-web-build, rust-docs),
-# Docker image build/push, and tagged GitHub releases under one caller-
-# friendly entry point. Each sibling is opt-in via an `enable-*` flag
-# (default `false` for the new sub-jobs, default `true` for build/docker/
-# release to preserve the original `@v1` contract). Pass-through inputs
-# for each sibling are prefixed `<sub-job>-*` so callers can configure
+# workflows (cargo-tests matrix, openapi-drift, leptos-web-build,
+# rust-docs), Docker image build/push, and tagged GitHub releases
+# under one caller-friendly entry point. Each sibling is opt-in via
+# an `enable-*` flag (default `false` for the opt-in sub-jobs,
+# default `true` for build/docker/release). Pass-through inputs for
+# each sibling are prefixed `<sub-job>-*` so callers can configure
 # them without colliding on shared names like `code-paths` or
 # `container-image`.
 #
-# `serialize-jobs:` toggle (per Spec jcttech/trading#185 follow-up): when
-# `true`, the chain `database-tests → openapi-drift → web-build` runs
-# fail-fast — a chain link only proceeds if the previous link reported
-# `success` or was skipped (a failure cascades into a skip on the next
-# link, mirroring the in-repo `needs:` chain that landed on trading's
-# main as the immediate fix for ARC OOM under PR #197). When `false`
-# (the default), failures don't cascade between chain links: each enabled
-# link runs independently. The wall-clock `needs:` chain is static —
-# GitHub Actions doesn't support dynamic `needs:`, so non-serial mode
-# still waits for the previous link to finish before starting the next;
-# the toggle controls failure propagation, not literal parallelism.
-# `docker` and `release` keep their pre-existing `!failure() &&
-# !cancelled()` semantics — failure of any chain link still blocks the
-# image push and the release artifact upload.
+# `serialize-jobs:` toggle: when `true`, the chain
+# `openapi-drift → web-build` runs fail-fast — a chain link only
+# proceeds if the previous link reported `success` or was skipped
+# (a failure cascades into a skip on the next link, mirroring the
+# in-repo `needs:` chain pattern). When `false` (the default),
+# failures don't cascade between chain links: each enabled link
+# runs independently. The wall-clock `needs:` chain is static —
+# GitHub Actions doesn't support dynamic `needs:`, so non-serial
+# mode still waits for the previous link to finish before starting
+# the next; the toggle controls failure propagation, not literal
+# parallelism. `docker` and `release` keep their pre-existing
+# `!failure() && !cancelled()` semantics — failure of any chain
+# link still blocks the image push and the release artifact upload.
 #
-# Backwards compatibility: every new input defaults to `false` (booleans)
-# or `''` (strings); existing `@v1` callers that only wire up
-# `enable-database-tests` see byte-identical job graphs and execution.
+# @v2 — Breaking change from @v1
+#
+# The legacy single-command `enable-database-tests` path and its
+# `database-test-command` / `database-tests-*` inputs are REMOVED.
+# Callers that used `enable-database-tests: true` must migrate to
+# the matrix-driven `enable-cargo-tests: true` + `cargo-tests:`
+# JSON array shape. The sibling `rust-database-tests.yml` still
+# exists in this repo and can still be called directly, but
+# `rust-pipeline.yml@v2` no longer dispatches to it. See the
+# `enable-cargo-tests` input docstring for the matrix entry schema.
 
 name: Rust Pipeline
 
@@ -68,53 +74,33 @@ on:
         type: string
         default: '--workspace --no-deps --document-private-items'
         description: 'Arguments passed to cargo doc'
-      enable-database-tests:
+      enable-cargo-tests:
         type: boolean
         default: false
-      database-test-command:
-        type: string
-        default: 'cargo test --test database_tests -- --nocapture'
-      postgres-image:
-        type: string
-        default: 'postgres:18'
-      init-sql:
-        type: string
-        default: ''
-        description: 'Path to SQL init script run via psql before database tests'
-      database-tests-pre-test-script:
-        type: string
-        default: ''
         description: |
-          Bash script path forwarded to `rust-database-tests.yml` as
-          `pre-test-script`. Caller-relative (lives in the consuming
-          repo). Receives the same DB env as the test step.
-      database-tests-survey-script:
+          Opt into the matrix-driven `cargo-tests.yml` sub-job. Lets
+          callers split their test surface into multiple named entries
+          (Unit, Integration, Server, etc.) that run in parallel, each
+          with its own command, optional Postgres sidecar, optional
+          bootstrap script, and optional path filter. Provide the matrix
+          via `cargo-tests` (JSON array). This is the v2 replacement
+          for the legacy `enable-database-tests` mono-command shape,
+          which was removed in this version.
+      cargo-tests:
         type: string
-        default: ''
+        default: '[]'
         description: |
-          Bash script path forwarded to `rust-database-tests.yml` as
-          `survey-script`. Captured stdout becomes the body of the
-          comment posted via `database-tests-post-survey-issue`.
-      database-tests-post-survey-issue:
-        type: string
-        default: ''
-        description: |
-          Issue/PR number forwarded to `rust-database-tests.yml` as
-          `post-survey-issue` (idempotent comment post; see that
-          workflow's docs for the marker contract).
-      database-tests-survey-marker:
-        type: string
-        default: ''
-        description: |
-          HTML-comment marker string forwarded to `rust-database-tests.yml`
-          as `survey-marker`. Required when
-          `database-tests-post-survey-issue` is set.
-      database-tests-code-paths:
-        type: string
-        default: ''
-        description: |
-          Newline-separated glob list forwarded to `rust-database-tests.yml`
-          as `code-paths` (D1 fast-lane). Empty default = always run.
+          JSON array of matrix entries forwarded to `cargo-tests.yml`.
+          Each entry object may contain:
+            name              (string, required) — display name; becomes the status check label
+            command           (string, required) — cargo test command
+            with-postgres     (string, default 'false') — 'true' spins up the Postgres sidecar
+            postgres-image    (string, default 'postgres:18')
+            pre-test-script   (string, default '') — caller-relative bash bootstrap
+            init-sql          (string, default '') — caller-relative SQL bootstrap (psql)
+            code-paths        (string, default '') — newline-separated globs; empty = always run
+            working-directory (string, default '.') — cwd for the test command
+          Example: '[{"name":"Unit","command":"cargo test -p foo"},{"name":"Integration","command":"cargo test -p bar","with-postgres":"true","pre-test-script":"./scripts/migrate.sh"}]'
       enable-openapi-drift:
         type: boolean
         default: false
@@ -218,18 +204,19 @@ on:
         type: boolean
         default: false
         description: |
-          When `true`, the chain `database-tests → openapi-drift →
-          web-build` runs fail-fast: each chain link only proceeds if
-          the previous link reported `success` or was skipped (failure
-          cascades). When `false` (the default), failures don't cascade
-          between chain links — each enabled link runs independently.
-          The `needs:` chain itself is static (GitHub Actions doesn't
-          support dynamic `needs:`), so non-serial mode still waits for
-          the previous link to finish before starting; the flag
-          controls failure propagation, not literal parallelism.
-          `docker` and `release` always cascade failures from any chain
-          link via their pre-existing `!failure()` semantics, regardless
-          of this flag.
+          When `true`, the chain `openapi-drift → web-build` runs
+          fail-fast: each chain link only proceeds if the previous link
+          reported `success` or was skipped (failure cascades). When
+          `false` (the default), failures don't cascade between chain
+          links — each enabled link runs independently. The `needs:`
+          chain itself is static (GitHub Actions doesn't support
+          dynamic `needs:`), so non-serial mode still waits for the
+          previous link to finish before starting; the flag controls
+          failure propagation, not literal parallelism. `docker` and
+          `release` always cascade failures from any chain link via
+          their pre-existing `!failure()` semantics, regardless of this
+          flag. The `cargo-tests` matrix (if enabled) runs independently
+          of this chain — see that job's comment for details.
       tag-prefix:
         type: string
         default: ''
@@ -369,36 +356,45 @@ jobs:
           name: binary
           path: target/release/${{ inputs.binary-name }}
 
-  database-tests:
+  # Matrix-driven cargo test splits — see `enable-cargo-tests` /
+  # `cargo-tests` inputs. Each entry gets its own status check named
+  # after `entry.name`. The chain-gate toggles on `serialize-jobs` do
+  # NOT apply here: cargo-tests entries are independent of each other
+  # and of the openapi-drift / web-build chain by design — a caller
+  # that wants a cargo-tests gate on openapi-drift / web-build should
+  # add an explicit `needs:` once they land in a future revision of
+  # this workflow.
+  cargo-tests:
     needs: changes
     if: >-
-      inputs.enable-database-tests &&
+      inputs.enable-cargo-tests &&
       (startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix)) ||
       github.event_name == 'pull_request' ||
       needs.changes.outputs.code == 'true')
-    uses: jcttech/.github/.github/workflows/rust-database-tests.yml@v1
+    strategy:
+      fail-fast: false
+      matrix:
+        entry: ${{ fromJson(inputs.cargo-tests) }}
+    uses: jcttech/.github/.github/workflows/cargo-tests.yml@v1
     secrets: inherit
     with:
-      test-command: ${{ inputs.database-test-command }}
-      postgres-image: ${{ inputs.postgres-image }}
-      rust-version: ${{ inputs.rust-version }}
+      name: ${{ matrix.entry.name }}
+      command: ${{ matrix.entry.command }}
+      with-postgres: ${{ matrix.entry.with-postgres }}
+      postgres-image: ${{ matrix.entry.postgres-image }}
+      pre-test-script: ${{ matrix.entry.pre-test-script }}
+      init-sql: ${{ matrix.entry.init-sql }}
+      code-paths: ${{ matrix.entry.code-paths }}
+      working-directory: ${{ matrix.entry.working-directory }}
       runner: ${{ inputs.runner }}
       container-image: ${{ inputs.container-image }}
-      init-sql: ${{ inputs.init-sql }}
-      pre-test-script: ${{ inputs.database-tests-pre-test-script }}
-      survey-script: ${{ inputs.database-tests-survey-script }}
-      post-survey-issue: ${{ inputs.database-tests-post-survey-issue }}
-      survey-marker: ${{ inputs.database-tests-survey-marker }}
-      code-paths: ${{ inputs.database-tests-code-paths }}
+      rust-version: ${{ inputs.rust-version }}
 
   openapi-drift:
-    needs: [changes, database-tests]
+    needs: changes
     if: >-
       !cancelled() &&
       inputs.enable-openapi-drift &&
-      (!inputs.serialize-jobs ||
-        needs.database-tests.result == 'success' ||
-        needs.database-tests.result == 'skipped') &&
       (startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix)) ||
       github.event_name == 'pull_request' ||
       needs.changes.outputs.code == 'true')
@@ -450,7 +446,7 @@ jobs:
       container-image: ${{ inputs.container-image }}
 
   docker:
-    needs: [changes, build, database-tests, openapi-drift, web-build]
+    needs: [changes, build, cargo-tests, openapi-drift, web-build]
     if: >-
       !failure() && !cancelled() &&
       inputs.enable-docker &&
@@ -524,7 +520,7 @@ jobs:
           tag-prefix: ${{ inputs.tag-prefix }}
 
   release:
-    needs: [build, docker, database-tests, openapi-drift, web-build]
+    needs: [build, docker, cargo-tests, openapi-drift, web-build]
     if: >-
       !failure() && !cancelled() &&
       inputs.enable-release &&

@@ -1,0 +1,307 @@
+# Cargo Tests — reusable workflow
+#
+# Runs `cargo test` with a caller-supplied command, optional Postgres
+# sidecar, optional pre-test bootstrap, and optional path-filter gating.
+# The status check name is taken from the `name` input so each call shows
+# up as a semantic split (e.g. `Unit`, `Integration`, `Server`, `Smoke`,
+# `Storage`) rather than the legacy generic "Database Tests".
+#
+# Designed to be **matrix-dispatched** from `rust-pipeline.yml`'s
+# `enable-cargo-tests` + `cargo-tests` inputs — each JSON entry the
+# caller provides becomes one invocation of this workflow, running in
+# parallel with sibling entries. A caller can also use this workflow
+# directly without going through `rust-pipeline.yml`.
+#
+# ## Why two jobs (`run-with-postgres`, `run-without-postgres`)
+#
+# GitHub Actions does not support conditional `services:` blocks inside
+# a single job — the Postgres container either spins up for every run of
+# that job, or never. To honour the `with-postgres` input cleanly
+# (without burning ~10 s of Postgres startup on every unit-test entry),
+# we declare two sibling jobs and gate each with a complementary `if:`.
+# Only one fires per invocation; the other is skipped. Both set
+# `name: ${{ inputs.name }}` so the matrix-rendered status check is
+# `cargo-tests (matrix.entry.name=Foo) / Foo`.
+#
+# ## Caller-relative path resolution
+#
+# `pre-test-script`, `init-sql`, and `working-directory` are interpreted
+# relative to the CALLER's repo checkout — these files live in the
+# consuming repo, not in `jcttech/.github`. This matches the convention
+# in the sibling `rust-database-tests.yml`.
+#
+# ## Backwards / forwards compat
+#
+# This is a new workflow; no existing callers. Adding fields to the
+# matrix entry JSON is additive — missing keys evaluate to empty
+# strings, which are then defaulted on the input side here. Removing or
+# renaming a field is a breaking change and would warrant a `@v2` tag.
+
+name: Cargo Tests
+
+on:
+  workflow_call:
+    inputs:
+      name:
+        type: string
+        description: |
+          Display name for this test split (e.g. "Unit", "Integration",
+          "Server"). Becomes the job name in the Actions UI and the
+          status check label on PRs.
+      command:
+        type: string
+        description: |
+          The cargo test command to run. Examples:
+            cargo test --workspace
+            cargo test -p foo -p bar --manifest-path crate/Cargo.toml
+            cargo nextest run --workspace
+      with-postgres:
+        type: string
+        default: 'false'
+        description: |
+          Spin up a Postgres sidecar service ("true" enables it). When
+          enabled, the test step gets `DATABASE_URL`, `PGHOST`, etc. in
+          env. Default "false" — most projects' unit-test entries should
+          leave this off to avoid ~10 s of wasted sidecar startup.
+      postgres-image:
+        type: string
+        default: 'postgres:18'
+        description: 'Docker image for the Postgres service (only when with-postgres="true").'
+      pre-test-script:
+        type: string
+        default: ''
+        description: |
+          Caller-relative path to a bash script run before the test
+          command. Typical use: schema bootstrap (e.g. `make
+          schema-apply` + a sqlx migrator). Receives the same DB env as
+          the test step. Only honoured when with-postgres="true".
+      init-sql:
+        type: string
+        default: ''
+        description: |
+          Caller-relative path to a SQL script run via `psql` before
+          the pre-test-script. Only honoured when with-postgres="true".
+      code-paths:
+        type: string
+        default: ''
+        description: |
+          Optional newline-separated glob list. When set and the event
+          is `pull_request`, `dorny/paths-filter@v4` decides whether
+          this entry runs; an empty match-set skips every subsequent
+          step (job exits green in <30 s). Empty default = always run.
+          Push events always run regardless.
+      working-directory:
+        type: string
+        default: '.'
+        description: 'cwd for the test command (and the pre-test-script).'
+      runner:
+        type: string
+        default: 'github-arc-github-arc-runner-set'
+        description: 'Runner label.'
+      container-image:
+        type: string
+        default: 'ghcr.io/jcttech/devcontainer-rust:latest'
+        description: |
+          Container image for the job pod (ARC K8s mode). Empty string
+          runs directly on the runner host.
+      rust-version:
+        type: string
+        default: 'stable'
+        description: 'Rust toolchain channel forwarded to rust-setup@v1.'
+      pg-host:
+        type: string
+        default: 'localhost'
+        description: |
+          PostgreSQL service hostname. Use `localhost` for ARC K8s and
+          GHA runners; the service name for Docker-mode runners.
+
+jobs:
+  # ────────────────────────────────────────────────────────────────
+  # Path 1: with-postgres="true" — full DB sidecar + optional bootstrap
+  # ────────────────────────────────────────────────────────────────
+  run-with-postgres:
+    name: ${{ inputs.name }}
+    if: inputs.with-postgres == 'true'
+    runs-on: ${{ inputs.runner }}
+    container: ${{ inputs.container-image || null }}
+    services:
+      postgres:
+        image: ${{ inputs.postgres-image }}
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test_db
+        options: >-
+          --health-cmd "pg_isready -U test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      PG_HOST: ${{ inputs.pg-host }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Mark workspace safe
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Build paths-filter input
+        id: build-filter
+        if: inputs.code-paths != '' && github.event_name == 'pull_request'
+        run: |
+          PATHS=$(echo "${{ inputs.code-paths }}" | sed '/^$/d' | sed 's/^/      - /')
+          {
+            echo "filters<<EOF"
+            echo "relevant:"
+            echo "$PATHS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Compute should-run from code-paths
+        id: changes
+        if: inputs.code-paths != '' && github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v4
+        with:
+          filters: ${{ steps.build-filter.outputs.filters }}
+
+      - name: Decide should-run
+        id: gate
+        run: |
+          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+            echo "should-run=true" >> "$GITHUB_OUTPUT"
+          elif [[ -z "${{ inputs.code-paths }}" ]]; then
+            echo "should-run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should-run=${{ steps.changes.outputs.relevant }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Rust
+        if: steps.gate.outputs.should-run == 'true'
+        uses: jcttech/.github/.github/actions/rust-setup@v1
+        with:
+          rust-version: ${{ inputs.rust-version }}
+
+      - name: Configure cargo for private git deps
+        if: steps.gate.outputs.should-run == 'true'
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          if [ -z "$PRIVATE_REPO_TOKEN" ]; then
+            echo "PRIVATE_REPO_TOKEN not set; cargo will use anonymous git access only"
+            exit 0
+          fi
+          git config --global url."https://x-access-token:${PRIVATE_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
+          echo "CARGO_NET_GIT_FETCH_WITH_CLI=true" >> "$GITHUB_ENV"
+          echo "Configured private git auth via PRIVATE_REPO_TOKEN for cargo fetch"
+
+      - name: Install PostgreSQL client
+        if: steps.gate.outputs.should-run == 'true' && (inputs.init-sql != '' || inputs.pre-test-script != '')
+        shell: bash
+        run: |
+          if ! command -v psql >/dev/null 2>&1; then
+            echo "Installing postgresql-client..."
+            if command -v apt-get >/dev/null 2>&1; then
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq postgresql-client
+            elif command -v apk >/dev/null 2>&1; then
+              sudo apk add --no-cache postgresql-client
+            else
+              echo "::error::Cannot install psql — no supported package manager found"
+              exit 1
+            fi
+          fi
+          psql --version
+
+      - name: Initialize database
+        if: steps.gate.outputs.should-run == 'true' && inputs.init-sql != ''
+        env:
+          PGHOST: ${{ env.PG_HOST }}
+          PGUSER: test
+          PGPASSWORD: test
+          PGDATABASE: test_db
+        run: psql -f ${{ inputs.init-sql }}
+
+      - name: Run pre-test script
+        if: steps.gate.outputs.should-run == 'true' && inputs.pre-test-script != ''
+        shell: bash
+        env:
+          PGHOST: ${{ env.PG_HOST }}
+          PGUSER: test
+          PGPASSWORD: test
+          PGDATABASE: test_db
+          DATABASE_URL: postgres://test:test@${{ env.PG_HOST }}:5432/test_db
+        run: bash "${{ inputs.pre-test-script }}"
+
+      - name: Run cargo tests
+        if: steps.gate.outputs.should-run == 'true'
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          DATABASE_URL: postgres://test:test@${{ env.PG_HOST }}:5432/test_db
+        run: ${{ inputs.command }}
+
+  # ────────────────────────────────────────────────────────────────
+  # Path 2: with-postgres!="true" — no DB sidecar, no DB bootstrap
+  # ────────────────────────────────────────────────────────────────
+  run-without-postgres:
+    name: ${{ inputs.name }}
+    if: inputs.with-postgres != 'true'
+    runs-on: ${{ inputs.runner }}
+    container: ${{ inputs.container-image || null }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Mark workspace safe
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Build paths-filter input
+        id: build-filter
+        if: inputs.code-paths != '' && github.event_name == 'pull_request'
+        run: |
+          PATHS=$(echo "${{ inputs.code-paths }}" | sed '/^$/d' | sed 's/^/      - /')
+          {
+            echo "filters<<EOF"
+            echo "relevant:"
+            echo "$PATHS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Compute should-run from code-paths
+        id: changes
+        if: inputs.code-paths != '' && github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v4
+        with:
+          filters: ${{ steps.build-filter.outputs.filters }}
+
+      - name: Decide should-run
+        id: gate
+        run: |
+          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+            echo "should-run=true" >> "$GITHUB_OUTPUT"
+          elif [[ -z "${{ inputs.code-paths }}" ]]; then
+            echo "should-run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should-run=${{ steps.changes.outputs.relevant }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Rust
+        if: steps.gate.outputs.should-run == 'true'
+        uses: jcttech/.github/.github/actions/rust-setup@v1
+        with:
+          rust-version: ${{ inputs.rust-version }}
+
+      - name: Configure cargo for private git deps
+        if: steps.gate.outputs.should-run == 'true'
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          if [ -z "$PRIVATE_REPO_TOKEN" ]; then
+            echo "PRIVATE_REPO_TOKEN not set; cargo will use anonymous git access only"
+            exit 0
+          fi
+          git config --global url."https://x-access-token:${PRIVATE_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
+          echo "CARGO_NET_GIT_FETCH_WITH_CLI=true" >> "$GITHUB_ENV"
+          echo "Configured private git auth via PRIVATE_REPO_TOKEN for cargo fetch"
+
+      - name: Run cargo tests
+        if: steps.gate.outputs.should-run == 'true'
+        working-directory: ${{ inputs.working-directory }}
+        run: ${{ inputs.command }}
