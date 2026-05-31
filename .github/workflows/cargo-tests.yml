@@ -12,16 +12,21 @@
 # parallel with sibling entries. A caller can also use this workflow
 # directly without going through `rust-pipeline.yml`.
 #
-# ## Why two jobs (`run-with-postgres`, `run-without-postgres`)
+# ## Single-job design (revised)
 #
-# GitHub Actions does not support conditional `services:` blocks inside
-# a single job — the Postgres container either spins up for every run of
-# that job, or never. To honour the `with-postgres` input cleanly
-# (without burning ~10 s of Postgres startup on every unit-test entry),
-# we declare two sibling jobs and gate each with a complementary `if:`.
-# Only one fires per invocation; the other is skipped. Both set
-# `name: ${{ inputs.name }}` so the matrix-rendered status check is
-# `cargo-tests (matrix.entry.name=Foo) / Foo`.
+# The first cut split this into two sibling jobs (`run-with-postgres`,
+# `run-without-postgres`) gated on the `with-postgres` input — needed
+# because GitHub Actions does not support conditional `services:`
+# blocks. That worked but produced an ugly status check for the skipped
+# sibling: the matrix-rendered display name was the literal expression
+# `inputs.name` (skipped jobs don't run the name-evaluation phase).
+#
+# This revision collapses to a single job. The Postgres service is
+# always declared and starts unconditionally; the DB-touching steps
+# (psql install, init-sql, pre-test-script, DATABASE_URL on the test
+# command) are individually gated on `inputs.with-postgres == 'true'`.
+# Cost: ~10s of wasted Postgres startup per unit-test run (no DB).
+# Benefit: one job per matrix entry, one semantic status check.
 #
 # ## Caller-relative path resolution
 #
@@ -32,10 +37,10 @@
 #
 # ## Backwards / forwards compat
 #
-# This is a new workflow; no existing callers. Adding fields to the
-# matrix entry JSON is additive — missing keys evaluate to empty
-# strings, which are then defaulted on the input side here. Removing or
-# renaming a field is a breaking change and would warrant a `@v2` tag.
+# Adding fields to the matrix entry JSON is additive — missing keys
+# evaluate to empty strings, which are then defaulted on the input
+# side here. Removing or renaming a field is a breaking change and
+# would warrant a new tag (e.g. `@v3`).
 
 name: Cargo Tests
 
@@ -59,22 +64,25 @@ on:
         type: string
         default: 'false'
         description: |
-          Spin up a Postgres sidecar service ("true" enables it). When
-          enabled, the test step gets `DATABASE_URL`, `PGHOST`, etc. in
-          env. Default "false" — most projects' unit-test entries should
-          leave this off to avoid ~10 s of wasted sidecar startup.
+          When 'true', the test step's environment includes
+          DATABASE_URL pointing at the in-job Postgres service, plus
+          the init-sql / pre-test-script bootstrap steps fire. When
+          anything else (incl. empty string for matrix entries that
+          omit the field), those DB-touching steps are skipped. The
+          Postgres service still starts (~10s overhead) regardless —
+          see the "Single-job design" comment at the top of this file.
       postgres-image:
         type: string
         default: 'postgres:18'
-        description: 'Docker image for the Postgres service (only when with-postgres="true").'
+        description: 'Docker image for the Postgres service.'
       pre-test-script:
         type: string
         default: ''
         description: |
           Caller-relative path to a bash script run before the test
           command. Typical use: schema bootstrap (e.g. `make
-          schema-apply` + a sqlx migrator). Receives the same DB env as
-          the test step. Only honoured when with-postgres="true".
+          schema-apply` + a sqlx migrator). Receives the same DB env
+          as the test step. Only honoured when with-postgres="true".
       init-sql:
         type: string
         default: ''
@@ -116,12 +124,8 @@ on:
           GHA runners; the service name for Docker-mode runners.
 
 jobs:
-  # ────────────────────────────────────────────────────────────────
-  # Path 1: with-postgres="true" — full DB sidecar + optional bootstrap
-  # ────────────────────────────────────────────────────────────────
-  run-with-postgres:
+  run:
     name: ${{ inputs.name }}
-    if: inputs.with-postgres == 'true'
     runs-on: ${{ inputs.runner }}
     container: ${{ inputs.container-image || null }}
     services:
@@ -194,7 +198,10 @@ jobs:
           echo "Configured private git auth via PRIVATE_REPO_TOKEN for cargo fetch"
 
       - name: Install PostgreSQL client
-        if: steps.gate.outputs.should-run == 'true' && (inputs.init-sql != '' || inputs.pre-test-script != '')
+        if: >-
+          steps.gate.outputs.should-run == 'true' &&
+          inputs.with-postgres == 'true' &&
+          (inputs.init-sql != '' || inputs.pre-test-script != '')
         shell: bash
         run: |
           if ! command -v psql >/dev/null 2>&1; then
@@ -212,7 +219,10 @@ jobs:
           psql --version
 
       - name: Initialize database
-        if: steps.gate.outputs.should-run == 'true' && inputs.init-sql != ''
+        if: >-
+          steps.gate.outputs.should-run == 'true' &&
+          inputs.with-postgres == 'true' &&
+          inputs.init-sql != ''
         env:
           PGHOST: ${{ env.PG_HOST }}
           PGUSER: test
@@ -221,7 +231,10 @@ jobs:
         run: psql -f ${{ inputs.init-sql }}
 
       - name: Run pre-test script
-        if: steps.gate.outputs.should-run == 'true' && inputs.pre-test-script != ''
+        if: >-
+          steps.gate.outputs.should-run == 'true' &&
+          inputs.with-postgres == 'true' &&
+          inputs.pre-test-script != ''
         shell: bash
         env:
           PGHOST: ${{ env.PG_HOST }}
@@ -231,77 +244,14 @@ jobs:
           DATABASE_URL: postgres://test:test@${{ env.PG_HOST }}:5432/test_db
         run: bash "${{ inputs.pre-test-script }}"
 
-      - name: Run cargo tests
-        if: steps.gate.outputs.should-run == 'true'
+      - name: Run cargo tests (with DATABASE_URL)
+        if: steps.gate.outputs.should-run == 'true' && inputs.with-postgres == 'true'
         working-directory: ${{ inputs.working-directory }}
         env:
           DATABASE_URL: postgres://test:test@${{ env.PG_HOST }}:5432/test_db
         run: ${{ inputs.command }}
 
-  # ────────────────────────────────────────────────────────────────
-  # Path 2: with-postgres!="true" — no DB sidecar, no DB bootstrap
-  # ────────────────────────────────────────────────────────────────
-  run-without-postgres:
-    name: ${{ inputs.name }}
-    if: inputs.with-postgres != 'true'
-    runs-on: ${{ inputs.runner }}
-    container: ${{ inputs.container-image || null }}
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Mark workspace safe
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - name: Build paths-filter input
-        id: build-filter
-        if: inputs.code-paths != '' && github.event_name == 'pull_request'
-        run: |
-          PATHS=$(echo "${{ inputs.code-paths }}" | sed '/^$/d' | sed 's/^/      - /')
-          {
-            echo "filters<<EOF"
-            echo "relevant:"
-            echo "$PATHS"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Compute should-run from code-paths
-        id: changes
-        if: inputs.code-paths != '' && github.event_name == 'pull_request'
-        uses: dorny/paths-filter@v4
-        with:
-          filters: ${{ steps.build-filter.outputs.filters }}
-
-      - name: Decide should-run
-        id: gate
-        run: |
-          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
-            echo "should-run=true" >> "$GITHUB_OUTPUT"
-          elif [[ -z "${{ inputs.code-paths }}" ]]; then
-            echo "should-run=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "should-run=${{ steps.changes.outputs.relevant }}" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Setup Rust
-        if: steps.gate.outputs.should-run == 'true'
-        uses: jcttech/.github/.github/actions/rust-setup@v1
-        with:
-          rust-version: ${{ inputs.rust-version }}
-
-      - name: Configure cargo for private git deps
-        if: steps.gate.outputs.should-run == 'true'
-        env:
-          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
-        run: |
-          if [ -z "$PRIVATE_REPO_TOKEN" ]; then
-            echo "PRIVATE_REPO_TOKEN not set; cargo will use anonymous git access only"
-            exit 0
-          fi
-          git config --global url."https://x-access-token:${PRIVATE_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
-          echo "CARGO_NET_GIT_FETCH_WITH_CLI=true" >> "$GITHUB_ENV"
-          echo "Configured private git auth via PRIVATE_REPO_TOKEN for cargo fetch"
-
       - name: Run cargo tests
-        if: steps.gate.outputs.should-run == 'true'
+        if: steps.gate.outputs.should-run == 'true' && inputs.with-postgres != 'true'
         working-directory: ${{ inputs.working-directory }}
         run: ${{ inputs.command }}
