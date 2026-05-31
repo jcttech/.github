@@ -375,7 +375,7 @@ jobs:
       fail-fast: false
       matrix:
         entry: ${{ fromJson(inputs.cargo-tests) }}
-    uses: jcttech/.github/.github/workflows/cargo-tests.yml@v1
+    uses: jcttech/.github/.github/workflows/cargo-tests.yml@v2
     secrets: inherit
     with:
       name: ${{ matrix.entry.name }}
