@@ -115,6 +115,33 @@ on:
         description: |
           Newline-separated glob list forwarded to `rust-database-tests.yml`
           as `code-paths` (D1 fast-lane). Empty default = always run.
+      enable-cargo-tests:
+        type: boolean
+        default: false
+        description: |
+          Opt into the matrix-driven `cargo-tests.yml` sub-job. Lets
+          callers split their test surface into multiple named entries
+          (Unit, Integration, Server, etc.) that run in parallel, each
+          with its own command, optional Postgres sidecar, optional
+          bootstrap script, and optional path filter. Provide the matrix
+          via `cargo-tests` (JSON array). This is the structural answer
+          to the legacy `enable-database-tests` mono-command shape — the
+          two coexist; new callers should prefer this.
+      cargo-tests:
+        type: string
+        default: '[]'
+        description: |
+          JSON array of matrix entries forwarded to `cargo-tests.yml`.
+          Each entry object may contain:
+            name              (string, required) — display name; becomes the status check label
+            command           (string, required) — cargo test command
+            with-postgres     (string, default 'false') — 'true' spins up the Postgres sidecar
+            postgres-image    (string, default 'postgres:18')
+            pre-test-script   (string, default '') — caller-relative bash bootstrap
+            init-sql          (string, default '') — caller-relative SQL bootstrap (psql)
+            code-paths        (string, default '') — newline-separated globs; empty = always run
+            working-directory (string, default '.') — cwd for the test command
+          Example: '[{"name":"Unit","command":"cargo test -p foo"},{"name":"Integration","command":"cargo test -p bar","with-postgres":"true","pre-test-script":"./scripts/migrate.sh"}]'
       enable-openapi-drift:
         type: boolean
         default: false
@@ -390,6 +417,42 @@ jobs:
       post-survey-issue: ${{ inputs.database-tests-post-survey-issue }}
       survey-marker: ${{ inputs.database-tests-survey-marker }}
       code-paths: ${{ inputs.database-tests-code-paths }}
+
+  # Matrix-driven cargo test splits — see `enable-cargo-tests` /
+  # `cargo-tests` inputs. Runs in parallel with `database-tests` (the
+  # two are independent — most callers will use one OR the other, but
+  # the workflow doesn't prevent mixing during a migration). Each entry
+  # gets its own status check named after `entry.name`. The chain-gate
+  # toggles on `serialize-jobs` do NOT apply here: cargo-tests entries
+  # are independent of each other and of the openapi-drift / web-build
+  # chain by design — a caller that wants a cargo-tests gate on
+  # openapi-drift / web-build should add an explicit `needs:` once they
+  # land in a future revision of this workflow.
+  cargo-tests:
+    needs: changes
+    if: >-
+      inputs.enable-cargo-tests &&
+      (startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix)) ||
+      github.event_name == 'pull_request' ||
+      needs.changes.outputs.code == 'true')
+    strategy:
+      fail-fast: false
+      matrix:
+        entry: ${{ fromJson(inputs.cargo-tests) }}
+    uses: jcttech/.github/.github/workflows/cargo-tests.yml@v1
+    secrets: inherit
+    with:
+      name: ${{ matrix.entry.name }}
+      command: ${{ matrix.entry.command }}
+      with-postgres: ${{ matrix.entry.with-postgres }}
+      postgres-image: ${{ matrix.entry.postgres-image }}
+      pre-test-script: ${{ matrix.entry.pre-test-script }}
+      init-sql: ${{ matrix.entry.init-sql }}
+      code-paths: ${{ matrix.entry.code-paths }}
+      working-directory: ${{ matrix.entry.working-directory }}
+      runner: ${{ inputs.runner }}
+      container-image: ${{ inputs.container-image }}
+      rust-version: ${{ inputs.rust-version }}
 
   openapi-drift:
     needs: [changes, database-tests]
