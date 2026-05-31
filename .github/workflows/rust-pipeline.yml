@@ -378,14 +378,22 @@ jobs:
     uses: jcttech/.github/.github/workflows/cargo-tests.yml@v2
     secrets: inherit
     with:
+      # `${{ expr || 'default' }}` fallbacks here are load-bearing —
+      # when a matrix entry omits an optional key, the GitHub
+      # expression evaluator passes empty string to the called
+      # workflow, which OVERRIDES the called workflow's input default
+      # (an empty string is not "missing", it's "explicitly empty").
+      # For `postgres-image`, an empty string skips the entire service
+      # container start, which breaks every with-postgres="true"
+      # caller — see PR #281 run 26703782289.
       name: ${{ matrix.entry.name }}
       command: ${{ matrix.entry.command }}
-      with-postgres: ${{ matrix.entry.with-postgres }}
-      postgres-image: ${{ matrix.entry.postgres-image }}
-      pre-test-script: ${{ matrix.entry.pre-test-script }}
-      init-sql: ${{ matrix.entry.init-sql }}
-      code-paths: ${{ matrix.entry.code-paths }}
-      working-directory: ${{ matrix.entry.working-directory }}
+      with-postgres: ${{ matrix.entry.with-postgres || 'false' }}
+      postgres-image: ${{ matrix.entry.postgres-image || 'postgres:18' }}
+      pre-test-script: ${{ matrix.entry.pre-test-script || '' }}
+      init-sql: ${{ matrix.entry.init-sql || '' }}
+      code-paths: ${{ matrix.entry.code-paths || '' }}
+      working-directory: ${{ matrix.entry.working-directory || '.' }}
       runner: ${{ inputs.runner }}
       container-image: ${{ inputs.container-image }}
       rust-version: ${{ inputs.rust-version }}
