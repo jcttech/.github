@@ -23,6 +23,16 @@ on:
         type: string
         default: ''
         description: 'Additional review instructions appended to the default prompt'
+    # Declared explicitly so callers can pass named secrets instead of
+    # `secrets: inherit` (least-privilege trust boundary). Both are optional
+    # because either credential alone is sufficient for claude-code-action.
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: false
+        description: 'Anthropic API key (alternative to CLAUDE_CODE_OAUTH_TOKEN)'
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: false
+        description: 'Claude Code OAuth token (alternative to ANTHROPIC_API_KEY)'
 
 jobs:
   review:

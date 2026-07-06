@@ -19,14 +19,28 @@ on:
         type: string
         default: 'ubuntu-latest'
         description: 'GitHub Actions runner to use'
+    # Declared explicitly so callers can pass named secrets instead of
+    # `secrets: inherit` (least-privilege trust boundary). Both are optional
+    # because either credential alone is sufficient for claude-code-action.
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: false
+        description: 'Anthropic API key (alternative to CLAUDE_CODE_OAUTH_TOKEN)'
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: false
+        description: 'Claude Code OAuth token (alternative to ANTHROPIC_API_KEY)'
 
 jobs:
   claude:
     name: Claude
     runs-on: ${{ inputs.runner }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
+    # Least privilege: the comment-triggered agent reads the repo and posts to
+    # PRs/issues; it must not push code (`contents: read`, not `write`).
+    # `id-token: write` is required by claude-code-action's OIDC exchange for
+    # its GitHub App token; `actions: read` lets it inspect CI results.
     permissions:
-      contents: write
+      contents: read
       pull-requests: write
       issues: write
       id-token: write
