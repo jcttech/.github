@@ -288,6 +288,52 @@ jobs:
     secrets: inherit
 ```
 
+#### `release.yml`
+
+Cuts a release by bumping the project version across **every manifest in lockstep** (`Cargo.toml`/`Cargo.lock`, `.claude-plugin/plugin.json` + `marketplace.json`, `pyproject.toml`, `package.json`), committing `Release vX.Y.Z`, and creating + pushing the `vX.Y.Z` tag. The mechanical bump is the deterministic, locally-testable [`version-bump`](#version-bump) composite action; this workflow adds the commit/tag/push. Building and publishing the artifacts stays with the consumer's existing tag-triggered pipeline (e.g. `rust-pipeline.yml` with `enable-release`).
+
+**Inputs:**
+| Input | Type | Default | Description |
+|-------|------|---------|-------------|
+| `bump` | string | `patch` | `patch` \| `minor` \| `major`, or an explicit `X.Y.Z` |
+| `runner` | string | `ubuntu-latest` | Runner label for the release job |
+| `committer-name` | string | `github-actions[bot]` | Name for the release commit |
+| `committer-email` | string | `41898282+github-actions[bot]@users.noreply.github.com` | Email for the release commit |
+
+**Secrets:**
+| Secret | Required | Description |
+|--------|----------|-------------|
+| `RELEASE_TOKEN` | no | PAT or GitHub App token used to checkout/push. Falls back to `GITHUB_TOKEN`. |
+
+**Outputs:** `version` (`X.Y.Z`) and `tag` (`vX.Y.Z`).
+
+> **Re-trigger note:** a tag pushed with the default `GITHUB_TOKEN` does **not** start further workflow runs (GitHub loop-prevention), so the consumer's tag-triggered build won't fire automatically. To fully automate, pass a PAT/App token as `RELEASE_TOKEN` (via `secrets: inherit`). Without it, the tag is still created — trigger the build manually, e.g. `gh workflow run ci.yml -f enable-release=true --ref vX.Y.Z`. Also ensure the default branch permits the release identity to push (allowlist it, or run releases off an unprotected branch).
+
+**Example caller (add to each repo):**
+```yaml
+# .github/workflows/release.yml
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'patch | minor | major | X.Y.Z'
+        type: string
+        default: patch
+
+jobs:
+  release:
+    uses: jcttech/.github/.github/workflows/release.yml@v1
+    with:
+      bump: ${{ inputs.bump }}
+    permissions:
+      contents: write
+    secrets: inherit
+```
+
+Then cut a release with `gh workflow run release.yml -f bump=minor` (or from the Actions tab).
+
 ### Composite Actions
 
 These can be used standalone in custom workflows.
@@ -319,6 +365,24 @@ These can be used standalone in custom workflows.
     image-name: 'my-image'  # optional, defaults to repo name
     push: 'true'            # optional
 ```
+
+#### `version-bump`
+
+Deterministically bumps the project version across every manifest present in the repo — `Cargo.toml`/`Cargo.lock`, `.claude-plugin/plugin.json` + `marketplace.json`, `pyproject.toml`, `package.json` — in lockstep, with minimal (version-line-only) diffs. Edits are value-agnostic and key-targeted, so a manifest that has drifted out of sync is healed to the target version. The version source of truth is the latest `v*` git tag (checkout with `fetch-depth: 0`). Backs [`release.yml`](#releaseyml); usable standalone.
+
+```yaml
+- uses: actions/checkout@v4
+  with:
+    fetch-depth: 0
+- id: bump
+  uses: jcttech/.github/.github/actions/version-bump@v1
+  with:
+    bump: minor        # patch | minor | major | X.Y.Z  (default: patch)
+    dry-run: 'false'   # optional: compute + print without writing
+# steps.bump.outputs.version -> 1.3.0 ; steps.bump.outputs.tag -> v1.3.0
+```
+
+The underlying `bump.sh` is pure bash (only `git`, `sed`, `awk`) and can be run locally: `bump.sh <patch|minor|major|X.Y.Z> [--dry-run]`.
 
 ### `code-paths:` Fast Lane Convention
 
@@ -393,6 +457,7 @@ Reusable workflows require the calling workflow to grant permissions that nested
 | `claude-review.yml` | `contents: read`, `pull-requests: write`, `issues: write`, `id-token: write` |
 | `claude.yml` | `contents: write`, `pull-requests: write`, `issues: write`, `id-token: write`, `actions: read` |
 | `cleanup-docker.yml` | `packages: write` |
+| `release.yml` | `contents: write` (release commit + tag) |
 
 ### Features
 
