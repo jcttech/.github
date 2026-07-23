@@ -170,9 +170,9 @@ jobs:
       - name: Decide should-run
         id: gate
         run: |
-          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
             echo "should-run=true" >> "$GITHUB_OUTPUT"
-          elif [[ -z "${{ inputs.code-paths }}" ]]; then
+          elif [ -z "${{ inputs.code-paths }}" ]; then
             echo "should-run=true" >> "$GITHUB_OUTPUT"
           else
             echo "should-run=${{ steps.changes.outputs.relevant }}" >> "$GITHUB_OUTPUT"
