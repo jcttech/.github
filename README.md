@@ -328,7 +328,9 @@ JCT TECH reusable workflows accept an optional `code-paths:` input that gates th
 
 - **Empty default** (`code-paths: ''`) — always run; the gate is a pass-through.
 - **Multi-line glob list** — on `pull_request` events, the workflow runs [`dorny/paths-filter@v4`](https://github.com/dorny/paths-filter) against the input. If nothing matches, every subsequent step is skipped (`if: steps.gate.outputs.should-run == 'true'`) and the job exits green in <30 s with no toolchain or build steps in the log.
-- **Push events** (e.g. push-to-main) always run regardless of the filter — the gate is bypassed for non-PR events so main-branch CI stays comprehensive.
+- **Push events** (e.g. push-to-main) always run regardless of the filter — the gate is bypassed for non-PR events so main-branch CI stays comprehensive. A push to the repository's **default branch** is treated as the canonical ground-truth build: the fast-lane is bypassed both at the reusable's step gate *and* at `rust-pipeline.yml`'s job-level `if:`, so the real build/test always executes there ([jcttech/trading#200](https://github.com/jcttech/trading/issues/200)).
+- **Fail-open** — if the path filter reaches no verdict (its step was skipped, the action errored, or the shell mangled the comparison), the gate runs the real work rather than reporting a silent green. Two production incidents came from the opposite default: `jcttech/trading#200` (push-event skip that concealed Bug #198 for months) and PR #20 (`[[` under `sh` on the ARC images, which silently skipped 135 database tests in `jcttech/claude-membank`).
+- **Skips are never silent** — when the gate does legitimately skip on a PR, a `Report path-gated skip` step writes the reason to `$GITHUB_STEP_SUMMARY`, so a path-gated skip is always distinguishable in the UI from a real build.
 
 **Currently supported:**
 

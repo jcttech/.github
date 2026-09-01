@@ -35,6 +35,21 @@
 # consuming repo, not in `jcttech/.github`. This matches the convention
 # in the sibling `rust-database-tests.yml`.
 #
+# ## D1 fast-lane and the push-to-default-branch bypass
+#
+# The optional `code-paths` input is the standardised docs-only skip
+# mechanism (Spec jcttech/trading#185 §D1) shared with the sibling
+# reusables. It is a PULL-REQUEST-ONLY optimisation.
+#
+# **Behaviour change (jcttech/trading#200):** a `push` to the repository's
+# DEFAULT BRANCH bypasses the fast-lane outright and always runs the real
+# test command — a default-branch push is the canonical ground-truth
+# build. The gate also FAILS OPEN when the filter reaches no verdict
+# (skipped step, action error, mangled shell comparison — the failure mode
+# behind #200 and PR #20), and any legitimate path-gated skip is written to
+# `$GITHUB_STEP_SUMMARY` so it is never a silent green. PR behaviour is
+# otherwise unchanged.
+#
 # ## Backwards / forwards compat
 #
 # Adding fields to the matrix entry JSON is additive — missing keys
@@ -169,14 +184,60 @@ jobs:
 
       - name: Decide should-run
         id: gate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          CODE_PATHS: ${{ inputs.code-paths }}
+          FILTER_RESULT: ${{ steps.changes.outputs.relevant }}
         run: |
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
-            echo "should-run=true" >> "$GITHUB_OUTPUT"
-          elif [ -z "${{ inputs.code-paths }}" ]; then
-            echo "should-run=true" >> "$GITHUB_OUTPUT"
+          # POSIX sh only -- these images may not carry bash (see PR #20).
+          #
+          # The D1 fast-lane (jcttech/trading#185 D1) is a PULL-REQUEST-ONLY
+          # optimisation. A push to the DEFAULT BRANCH is the canonical
+          # ground-truth build, so it bypasses the path filter entirely and
+          # always runs the real work -- jcttech/trading#200 option 2.
+          if [ "$EVENT_NAME" = "push" ] && [ -n "$DEFAULT_BRANCH" ] \
+             && [ "$REF_NAME" = "$DEFAULT_BRANCH" ]; then
+            RUN=true
+            REASON="push to the default branch ($DEFAULT_BRANCH); D1 fast-lane bypassed"
+          elif [ "$EVENT_NAME" != "pull_request" ]; then
+            RUN=true
+            REASON="event '$EVENT_NAME' is not a pull_request; D1 fast-lane does not apply"
+          elif [ -z "$CODE_PATHS" ]; then
+            RUN=true
+            REASON="no code-paths filter configured"
+          elif [ "$FILTER_RESULT" = "true" ]; then
+            RUN=true
+            REASON="code-paths matched the pull-request diff"
+          elif [ "$FILTER_RESULT" = "false" ]; then
+            RUN=false
+            REASON="no file in the pull-request diff matched code-paths"
           else
-            echo "should-run=${{ steps.changes.outputs.relevant }}" >> "$GITHUB_OUTPUT"
+            # The filter reached no verdict: its step was skipped, the action
+            # failed, or the shell mangled the gate (the exact failure mode
+            # behind jcttech/trading#200 and PR #20). FAIL OPEN -- run the real
+            # work rather than report a silent green.
+            RUN=true
+            REASON="path filter reached no verdict; running anyway (fail-open)"
           fi
+          echo "should-run=$RUN" >> "$GITHUB_OUTPUT"
+          echo "reason=$REASON" >> "$GITHUB_OUTPUT"
+          echo "should-run=$RUN ($REASON)"
+
+      - name: Report path-gated skip
+        if: steps.gate.outputs.should-run != 'true'
+        env:
+          REASON: ${{ steps.gate.outputs.reason }}
+        run: |
+          {
+            echo "### Skipped: Cargo Tests (path-gated)"
+            echo
+            echo "No build or test ran in this job -- it was gated off by the"
+            echo "D1 code-paths fast-lane, not executed and passed."
+            echo
+            echo "Reason: $REASON"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Setup Rust
         if: steps.gate.outputs.should-run == 'true'

@@ -257,6 +257,20 @@ on:
           flip back to `false` once the cache has been rewritten.
 
 jobs:
+  # Top-level path filter. On `pull_request` events this is the D1
+  # fast-lane's coarse gate; on a `push` to the DEFAULT BRANCH it is
+  # advisory only — every gated job below carries an explicit
+  # `push`-to-default-branch clause that runs it regardless of the
+  # filter verdict.
+  #
+  # Why: `dorny/paths-filter` on a push event compares against the
+  # pushed range, which for a squash-merge to main is a single commit.
+  # A merge that touched no filtered path (or where the filter reached
+  # no verdict at all) previously skipped the real build while the run
+  # still reported green — jcttech/trading#200. The D1 fast-lane
+  # (jcttech/trading#185 §D1) was always a PR-only optimisation; a push
+  # to the default branch is the canonical ground-truth build and is no
+  # longer eligible for it.
   changes:
     runs-on: ${{ inputs.runner }}
     container: ${{ inputs.container-image || null }}
@@ -366,11 +380,16 @@ jobs:
   # this workflow.
   cargo-tests:
     needs: changes
+    # The trailing `push`-to-default-branch clause bypasses the D1
+    # fast-lane on the canonical ground-truth build (jcttech/trading#200
+    # option 2). See the note above the `changes` job.
     if: >-
       inputs.enable-cargo-tests &&
       (startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix)) ||
       github.event_name == 'pull_request' ||
-      needs.changes.outputs.code == 'true')
+      needs.changes.outputs.code == 'true' ||
+      (github.event_name == 'push' &&
+       github.ref_name == github.event.repository.default_branch))
     strategy:
       fail-fast: false
       matrix:
@@ -405,7 +424,9 @@ jobs:
       inputs.enable-openapi-drift &&
       (startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix)) ||
       github.event_name == 'pull_request' ||
-      needs.changes.outputs.code == 'true')
+      needs.changes.outputs.code == 'true' ||
+      (github.event_name == 'push' &&
+       github.ref_name == github.event.repository.default_branch))
     uses: jcttech/.github/.github/workflows/openapi-drift.yml@v1
     secrets: inherit
     with:
@@ -425,7 +446,9 @@ jobs:
         needs.openapi-drift.result == 'skipped') &&
       (startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix)) ||
       github.event_name == 'pull_request' ||
-      needs.changes.outputs.code == 'true')
+      needs.changes.outputs.code == 'true' ||
+      (github.event_name == 'push' &&
+       github.ref_name == github.event.repository.default_branch))
     uses: jcttech/.github/.github/workflows/leptos-web-build.yml@v1
     secrets: inherit
     with:
