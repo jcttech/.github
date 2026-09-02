@@ -1,0 +1,41 @@
+name: 'Version Bump'
+description: >-
+  Deterministically bump the project version across every manifest present in
+  the repo (Cargo.toml/Cargo.lock, .claude-plugin/*.json, pyproject.toml,
+  package.json) in lockstep. Version source of truth is the latest v* git tag.
+
+inputs:
+  bump:
+    description: 'Bump level (patch|minor|major) or an explicit X.Y.Z'
+    required: false
+    default: 'patch'
+  dry-run:
+    description: 'Compute and print the changes without writing files'
+    required: false
+    default: 'false'
+
+outputs:
+  version:
+    description: 'The resolved new version (X.Y.Z)'
+    value: ${{ steps.run.outputs.version }}
+  tag:
+    description: 'The release tag (vX.Y.Z)'
+    value: ${{ steps.run.outputs.tag }}
+
+runs:
+  using: 'composite'
+  steps:
+    - id: run
+      shell: bash
+      env:
+        BUMP: ${{ inputs.bump }}
+        DRY_RUN: ${{ inputs.dry-run }}
+      run: |
+        set -euo pipefail
+        args=("$BUMP")
+        [ "$DRY_RUN" = "true" ] && args+=(--dry-run)
+        # bump.sh prints diagnostics to stderr and the bare version as its
+        # final stdout line.
+        version="$(bash "$GITHUB_ACTION_PATH/bump.sh" "${args[@]}" | tail -n1)"
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+        echo "tag=v$version"    >> "$GITHUB_OUTPUT"

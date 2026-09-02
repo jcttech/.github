@@ -1,0 +1,107 @@
+# Release — reusable workflow (@v1)
+#
+# Cuts a release by bumping the project version across every manifest in
+# lockstep, committing "Release vX.Y.Z", and creating + pushing the vX.Y.Z tag.
+# The mechanical bump lives in the `version-bump` composite action so it is
+# deterministic and locally testable; this workflow adds the commit/tag/push.
+#
+# Division of labour: this workflow *cuts the version* (commit + tag). Building
+# and publishing the release artifacts stays with the consumer's existing
+# tag-triggered pipeline (e.g. `rust-pipeline.yml` with `enable-release`).
+#
+# Re-trigger note (important): a tag pushed with the default `GITHUB_TOKEN`
+# does NOT start further workflow runs (GitHub's loop-prevention), so the
+# consumer's tag-triggered build won't fire automatically. To fully automate,
+# pass a PAT or GitHub App token as the `RELEASE_TOKEN` secret (via
+# `secrets: inherit`); the tag push then triggers the consumer's release build
+# as normal. Without it, the tag is still created — trigger the build manually,
+# e.g. `gh workflow run ci.yml -f enable-release=true --ref vX.Y.Z`.
+#
+# The consumer's default branch must permit this job to push the release
+# commit (allowlist the release identity, or run releases off an unprotected
+# branch) if branch protection is enabled.
+#
+# `code-paths` fast-lane: intentionally omitted — this workflow only runs on
+# `workflow_call` (never on pull_request), so the docs-only PR gate does not apply.
+
+name: Release
+
+on:
+  workflow_call:
+    inputs:
+      bump:
+        type: string
+        default: 'patch'
+        description: 'Version bump: patch | minor | major, or an explicit X.Y.Z'
+      runner:
+        type: string
+        default: 'ubuntu-latest'
+        description: 'Runner label for the release job'
+      committer-name:
+        type: string
+        default: 'github-actions[bot]'
+        description: 'Name used for the release commit'
+      committer-email:
+        type: string
+        default: '41898282+github-actions[bot]@users.noreply.github.com'
+        description: 'Email used for the release commit'
+    secrets:
+      RELEASE_TOKEN:
+        required: false
+        description: >-
+          PAT or GitHub App token used to checkout/push so the tag push
+          re-triggers the consumer's tag-based build. Falls back to
+          GITHUB_TOKEN (which will not re-trigger tag workflows).
+    outputs:
+      version:
+        description: 'The released version (X.Y.Z)'
+        value: ${{ jobs.release.outputs.version }}
+      tag:
+        description: 'The release tag (vX.Y.Z)'
+        value: ${{ jobs.release.outputs.tag }}
+
+jobs:
+  release:
+    runs-on: ${{ inputs.runner }}
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      tag: ${{ steps.bump.outputs.tag }}
+    steps:
+      - name: Checkout (full history for tags)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Bump version across manifests
+        id: bump
+        uses: jcttech/.github/.github/actions/version-bump@v1
+        with:
+          bump: ${{ inputs.bump }}
+
+      - name: Commit, tag, and push
+        env:
+          TAG: ${{ steps.bump.outputs.tag }}
+          VERSION: ${{ steps.bump.outputs.version }}
+          NAME: ${{ inputs.committer-name }}
+          EMAIL: ${{ inputs.committer-email }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet && git diff --cached --quiet; then
+            echo "::error::No manifest changes produced for $VERSION — is it already released?"
+            exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "::error::Tag $TAG already exists."
+            exit 1
+          fi
+          git config user.name  "$NAME"
+          git config user.email "$EMAIL"
+          git add -A
+          git commit -m "Release $TAG"
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin HEAD
+          git push origin "$TAG"
+          echo "::notice::Released $TAG"
