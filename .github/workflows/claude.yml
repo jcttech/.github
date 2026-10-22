@@ -52,7 +52,7 @@ jobs:
           fetch-depth: 1
 
       - name: Run Claude
-                # Pinned to v1.0.256 on 2026-10-22: v1.0.257 (released 2026-10-21 22:21Z, Claude Code
+        # Pinned to v1.0.256 on 2026-10-22: v1.0.257 (released 2026-10-21 22:21Z, Claude Code
         # 2.1.307) fails at init in this action — `is_error: true` after one turn, no model
         # call, no review posted (jcttech/trading PR #627, two attempts). v1.0.256 (Claude Code
         # 2.1.306) ran every earlier review that day. Return to `@v1` once a later release
