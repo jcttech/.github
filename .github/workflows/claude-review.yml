@@ -19,7 +19,7 @@ on:
         type: boolean
         required: false
         default: false
-        description: 'Print Claude Code'"'"'s full execution output in the job log (the action hides it by default, so an `is_error: true` with no model usage shows no reason). Diagnostic only.'
+        description: "Print Claude Code's full execution output in the job log (the action hides it by default, so an is_error: true with no model usage shows no reason). Diagnostic only."
       runner:
         type: string
         default: 'ubuntu-latest'
