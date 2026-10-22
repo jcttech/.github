@@ -15,6 +15,11 @@ on:
         type: number
         default: 20
         description: 'Maximum runtime in minutes'
+      show-full-output:
+        type: boolean
+        required: false
+        default: false
+        description: 'Print Claude Code'"'"'s full execution output in the job log (the action hides it by default, so an `is_error: true` with no model usage shows no reason). Diagnostic only.'
       runner:
         type: string
         default: 'ubuntu-latest'
@@ -196,6 +201,7 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ github.token }}
           use_sticky_comment: false
+          show_full_output: ${{ inputs.show-full-output }}
           claude_args: |
             --model ${{ inputs.model }}
             --max-turns ${{ inputs.max-turns }}
