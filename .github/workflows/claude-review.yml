@@ -233,8 +233,11 @@ jobs:
 
             ### Review Event Rules
             - **`REQUEST_CHANGES`**: Use when there are CRITICAL, HIGH, or MEDIUM findings
-            - **`COMMENT`**: Use when there are only LOW findings
-            - **`APPROVE`**: Use when the PR looks good with no new issues, OR when all previous issues have been addressed
+            - **`APPROVE`**: Use when the PR looks good with no new issues, OR when all previous issues have been addressed,
+              **OR when the only remaining findings are LOW**. LOW findings never block a merge: list them in the review
+              body under a `### Follow-ups (LOW — fold into the next story)` heading (one line each, with file:line),
+              and still post the inline comments marked **[LOW]** so the author can fix them in the next story's PR.
+            - **`COMMENT`**: do not use for findings. Reserve it for a review that could not finish (say what was skipped).
 
             CRITICAL: Always post a review, even if incomplete. A partial review is better than none.
 
@@ -286,11 +289,13 @@ jobs:
             1. `/tmp/unresolved-threads.json` is empty (`[]`) AND zero new findings (after dedup)
                → post **APPROVE** (all previous issues were fixed or accepted as deferred).
             2. `/tmp/unresolved-threads.json` is empty (`[]`) AND ≥1 new findings
-               → post **REQUEST_CHANGES** or **COMMENT** with only the new findings.
+               → post **REQUEST_CHANGES** with only the new findings if any is CRITICAL / HIGH / MEDIUM;
+               if every new finding is LOW, post **APPROVE** with the LOWs listed as follow-ups (they never block).
             3. `/tmp/unresolved-threads.json` has entries AND zero new findings (after dedup)
                → do NOT post a new review (existing threads already cover everything actionable).
             4. `/tmp/unresolved-threads.json` has entries AND ≥1 new findings
-               → post **REQUEST_CHANGES** or **COMMENT** with only the new findings.
+               → post **REQUEST_CHANGES** with only the new findings if any is CRITICAL / HIGH / MEDIUM;
+               if every new finding is LOW and every unresolved thread is LOW, post **APPROVE** with the LOWs as follow-ups.
 
             **IMPORTANT**: When the unresolved list is empty AND no new findings remain after
             dedup, you MUST post an **APPROVE** review. Resolved-thread overlap counts as
