@@ -259,6 +259,23 @@ jobs:
             echo "Reason: $REASON"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Configure cargo for private git deps
+        # Consumers may depend on private git crates (jcttech/trading →
+        # jcttech/mt5-api's mt5-api-types). cargo resolves every source in the
+        # lockfile for any command, so this must run before the first cargo
+        # invocation. No-op when the caller passes no PRIVATE_REPO_TOKEN.
+        if: steps.gate.outputs.should-run == 'true'
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          if [ -z "$PRIVATE_REPO_TOKEN" ]; then
+            echo "PRIVATE_REPO_TOKEN not set; cargo will use anonymous git access only"
+            exit 0
+          fi
+          git config --global url."https://x-access-token:${PRIVATE_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
+          echo "CARGO_NET_GIT_FETCH_WITH_CLI=true" >> "$GITHUB_ENV"
+          echo "Configured private git auth via PRIVATE_REPO_TOKEN for cargo fetch"
+
       - name: Build (release WASM + size gate)
         if: steps.gate.outputs.should-run == 'true'
         working-directory: ${{ inputs.working-directory }}
