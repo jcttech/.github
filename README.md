@@ -182,11 +182,18 @@ Automated multi-angle PR review powered by Claude. Reviews every PR for code qua
 **Inputs:**
 | Input | Type | Default | Description |
 |-------|------|---------|-------------|
-| `model` | string | `claude-sonnet-4-6` | Claude model to use for review |
-| `max-turns` | number | `10` | Maximum conversation turns (controls cost) |
-| `timeout-minutes` | number | `15` | Maximum runtime in minutes |
+| `model` | string | `claude-opus-5-5` | Claude model to use for review |
+| `max-turns` | number | `50` | Maximum conversation turns (controls cost) |
+| `timeout-minutes` | number | `20` | Maximum runtime in minutes (the Claude step stops a few minutes earlier, so the check after it still runs) |
 | `runner` | string | `ubuntu-latest` | GitHub Actions runner to use |
 | `review-extra` | string | `''` | Additional review instructions appended to the default prompt |
+| `fail-on-missing-review` | boolean | `true` | Fail the job when Claude ends without posting a review on the head commit. `false` only warns |
+
+**Outputs:** `review-posted` (`true`/`false`), `review-state` (`APPROVED`, `CHANGES_REQUESTED`, `COMMENTED` or empty), `review-outcome` (`posted`, `salvaged`, `no-new-findings`, `superseded` or `missing`) and `review-failure-reason` (one line).
+
+**Large PRs.** Before Claude runs, the workflow splits the PR's diff into one annotated file per changed file (parts of at most ~40 KB, every line with its new and old line number) plus an index, and Claude reads those with the Read tool. One `gh pr diff` call returns only the start of a large diff, and the commands that page through shell output aren't allowed. When GitHub refuses the diff (over 20,000 lines or 300 files), the workflow builds it from git instead.
+
+**When no review is posted.** A run that ends without a review on the head commit is reported as a failure, not as success. If Claude wrote a draft but didn't post it, the workflow posts the draft as an incomplete review (an `APPROVE` draft is posted as a `COMMENT`). Without a draft, it comments "Claude Review could not complete" on the PR with the reason (out of turns, timed out, an API error, or stopped early, plus any refused tool calls). Either way the job fails, unless `fail-on-missing-review` is `false`. A re-review whose findings are all open threads already posts no review on purpose and is not a failure.
 
 **Review perspectives (built-in):**
 1. Code quality and maintainability
