@@ -827,7 +827,12 @@ jobs:
         env:
           CT_FEATURE_CHECK: ${{ inputs.cargo-tests-feature-check }}
         run: |
-          set -euo pipefail -f
+          set -uo pipefail -f
+          # Advisory: no failure in here may fail the build. Without -e, a
+          # failed resolution or comparison skips the check (`ok=false`) and
+          # the archive is shared as planned. C collation, so `sort` and
+          # `join` agree on the order whatever the image's locale.
+          export LC_ALL=C
           # Which lanes share the archive, after the feature-unification check.
           # Cargo unifies features across every package of one build, so a lane's
           # crates can compile with more features in the union than in a build of
@@ -855,7 +860,7 @@ jobs:
             [ -n "$2" ] && a+=(--features "$2")
             cargo tree --manifest-path "$manifest" -e normal,build,dev --prefix none -f '{p}|{f}' "${a[@]}" \
               | sed 's/ (\*)$//' | sort -u \
-              | awk -F'|' '{ k = $1; v[k] = (k in v) ? v[k] ";" $2 : $2 } END { for (k in v) print k "|" v[k] }' | sort
+              | awk -F'|' '$1 != "" { k = $1; v[k] = (k in v) ? v[k] ";" $2 : $2 } END { for (k in v) print k "|" v[k] }' | sort -t'|' -k1,1
           }
 
           excluded=()
@@ -868,7 +873,9 @@ jobs:
               changed=false; keep=()
               for n in "${lanes[@]}"; do
                 if ! A=$(resolve "$(lpk "$n")" "$(lft "$n")"); then ok=false; break 2; fi
-                d=$(join -t'|' -j1 <(printf '%s\n' "$A") <(printf '%s\n' "$U") | awk -F'|' '$2 != $3 { print $1 "|" $2 "|" $3 }')
+                if ! d=$(join -t'|' -j1 <(printf '%s\n' "$A") <(printf '%s\n' "$U") | awk -F'|' '$2 != $3 { print $1 "|" $2 "|" $3 }'); then
+                  ok=false; break 2
+                fi
                 diffs_all[$n]=$(printf '%s' "$d" | grep -c . || true)
                 diffs_ws[$n]=$(printf '%s\n' "$d" | grep -F "($GITHUB_WORKSPACE/" \
                   | sed -E "s#^([^ ]+) [^|]*\|([^|]*)\|(.*)\$#\1: alone [\2] / shared [\3]#; s/\[;/[/g; s/;\]/]/g" || true)
@@ -881,7 +888,10 @@ jobs:
               lanes=("${keep[@]}")
               { [ "$changed" = true ] && [ "${#lanes[@]}" -ge 2 ]; } || break
             done
-            [ "$ok" = true ] || echo "::warning title=cargo-tests::cargo tree failed, so the feature-unification check was skipped (the archive is shared as planned)"
+            if [ "$ok" != true ]; then
+              echo "::warning title=cargo-tests::the feature-unification check could not run (cargo tree or the comparison failed), so the archive is shared as planned"
+              lanes=("${planned[@]}"); excluded=()
+            fi
           fi
           if [ "${#lanes[@]}" -lt 2 ]; then
             excluded+=("${lanes[@]}"); lanes=()
