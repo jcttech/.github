@@ -1,4 +1,4 @@
-# Rust Pipeline — reusable workflow (@v2)
+# Rust Pipeline — reusable workflow (@v3)
 #
 # Aggregates change detection, build/clippy/test, optional sibling
 # workflows (cargo-tests matrix, openapi-drift, leptos-web-build,
@@ -34,6 +34,39 @@
 # exists in this repo and can still be called directly, but
 # `rust-pipeline.yml@v2` no longer dispatches to it. See the
 # `enable-cargo-tests` input docstring for the matrix entry schema.
+#
+# @v3 — cargo-tests: build once, run everywhere (jcttech/trading#1160)
+#
+# v2 built and linked every cargo-tests lane's test binaries in the
+# lane's own pod. sccache serves the crate compiles, but linking isn't
+# cached, so overlapping lanes linked the same heavy binaries again and a
+# re-run of one failed lane rebuilt it. v3 builds the TRIGGERED lanes'
+# test binaries once, in a `cargo-tests-archive` job (`cargo nextest
+# archive`), uploads the archive as an artifact of the run, and every
+# lane downloads it and runs its partition (`-E 'package(=…)'`). A re-run
+# of a failed lane reuses the archive; it builds nothing.
+#
+# It is the DEFAULT (`cargo-tests-build-once: true`) for lanes that say
+# what they build — the structured `packages` field (see
+# `enable-cargo-tests`). Everything else keeps v2's per-lane behaviour:
+#   - `cargo-tests-build-once: false` (the opt-out; v2 exactly);
+#   - an entry's `build-once: 'false'`;
+#   - a legacy entry with only `command` (the pipeline can't tell what a
+#     free-form command builds);
+#   - no cargo-nextest in the image;
+#   - fewer than two triggered lanes qualify (nothing to share);
+#   - `cargo-tests-feature-check: strict` and the lane's workspace crates
+#     would compile with other features in the union.
+# Gating reuses what consumers already write: the per-lane `code-paths`
+# are evaluated once, in `changes`, with v2's rules (pull requests only;
+# fail-open), and the archive holds only the union of the lanes they
+# triggered. The archive job runs only when two or more triggered lanes
+# run from it. Doc tests (nextest archives carry none) run in the archive
+# job against the same build and are attributed back to the lanes.
+#
+# Check names: each lane is `cargo-tests (<name>) / <name>` (v2 rendered
+# the whole matrix entry into the middle part, command text included);
+# the new job is `cargo-tests-archive`.
 
 name: Rust Pipeline
 
@@ -83,24 +116,125 @@ on:
           (Unit, Integration, Server, etc.) that run in parallel, each
           with its own command, optional Postgres sidecar, optional
           bootstrap script, and optional path filter. Provide the matrix
-          via `cargo-tests` (JSON array). This is the v2 replacement
-          for the legacy `enable-database-tests` mono-command shape,
-          which was removed in this version.
+          via `cargo-tests` (JSON array). Since v3, lanes that declare
+          their `packages` run from one shared test archive by default
+          (`cargo-tests-build-once`).
       cargo-tests:
         type: string
         default: '[]'
         description: |
-          JSON array of matrix entries forwarded to `cargo-tests.yml`.
+          JSON array of matrix entries, one lane each (`cargo-tests.yml`).
           Each entry object may contain:
             name              (string, required) — display name; becomes the status check label
-            command           (string, required) — cargo test command
+            command           (string) — free-form shell; what the lane runs when it builds
+                                its own test binaries. Required unless `packages` is set.
             with-postgres     (string, default 'false') — 'true' spins up the Postgres sidecar
             postgres-image    (string, default 'postgres:18')
             pre-test-script   (string, default '') — caller-relative bash bootstrap
             init-sql          (string, default '') — caller-relative SQL bootstrap (psql)
             code-paths        (string, default '') — newline-separated globs; empty = always run
             working-directory (string, default '.') — cwd for the test command
-          Example: '[{"name":"Unit","command":"cargo test -p foo"},{"name":"Integration","command":"cargo test -p bar","with-postgres":"true","pre-test-script":"./scripts/migrate.sh"}]'
+          v3 structured fields (an entry with `packages` can run from the shared archive):
+            packages          (string) — space/newline-separated workspace packages (the `-p` list)
+            features          (string, default '') — cargo features (`pkg/feature` form recommended)
+            profile           (string, default '') — nextest profile
+            filter            (string, default '') — nextest filterset, ANDed with the packages
+            nextest-args      (string, default '') — other `cargo nextest run` args, e.g.
+                                `--run-ignored only --test-threads 1` (no -p/-E/--features/
+                                --profile/--manifest-path: use the fields above)
+            doctests          ('true'|'false', default 'false') — the packages' doc tests must pass
+            setup             (string, default '') — shell run before the tests, same step
+                                (start a service, `export` its URL)
+            test-wrapper      (string, default '') — prefix for the test command
+            build-once        ('true'|'false', default 'true') — 'false': this lane builds itself
+            build-jobs        (string, default `cargo-tests-build-jobs`) — CARGO_BUILD_JOBS when
+                                this lane builds itself; '' = unset
+          With `packages` and no `command`, the lane's own build-and-test command
+          is composed from the fields; with both, `command` is used whenever the
+          lane builds itself and the fields drive the archive path.
+          Example: '[{"name":"Unit","packages":"foo","doctests":"true"},{"name":"Integration","packages":"bar baz","profile":"ci","with-postgres":"true","pre-test-script":"./scripts/migrate.sh"}]'
+      cargo-tests-build-once:
+        type: boolean
+        default: true
+        description: |
+          Build the triggered structured lanes' test binaries once
+          (`cargo-tests-archive` job, `cargo nextest archive`) and run
+          every lane from that archive. `false` restores v2 exactly: no
+          archive job, each lane builds and tests in its own pod.
+      cargo-tests-manifest-path:
+        type: string
+        default: 'Cargo.toml'
+        description: |
+          Repo-root-relative path of the workspace manifest the structured
+          lanes build from (e.g. `jtrader/Cargo.toml`).
+      cargo-tests-build-jobs:
+        type: string
+        default: '1'
+        description: |
+          `CARGO_BUILD_JOBS` for the archive build and for structured lanes
+          that build themselves (an entry's `build-jobs` overrides it).
+          Conservative on purpose: one rustc or link resident at a time is
+          what keeps the big test binaries' links inside the runner pod's
+          memory (jcttech/trading#201). Raise it on measured headroom. ''
+          leaves it unset (cargo's default: one job per CPU).
+      cargo-tests-build-env:
+        type: string
+        default: ''
+        description: |
+          Newline-separated `KEY=VALUE` lines exported for every build the
+          pipeline composes: the archive build, its doc tests, and the
+          structured lanes that build themselves (e.g.
+          `CARGO_PROFILE_DEV_DEBUG=line-tables-only`). A legacy `command`
+          is run as written, without them.
+      cargo-tests-build-wrapper:
+        type: string
+        default: ''
+        description: |
+          Command prefix the archive build (and a structured lane's own
+          build) runs under, e.g. `bash scripts/ci/mem-probe.sh build --`.
+          Runs from the repository root.
+      cargo-tests-feature-check:
+        type: string
+        default: 'report'
+        description: |
+          Cargo unifies features across the packages of one build, so a
+          lane's crates can compile with more features in the shared
+          archive than in a build of that lane alone (`cargo test
+          --workspace` has the same property). `report`: share the archive
+          and list, per lane, the workspace crates whose features differ in
+          the `cargo-tests-archive` job summary. `strict`: those lanes build
+          on their own instead. `off`: skip the check.
+      cargo-tests-archive-warn-mib:
+        type: number
+        default: 2048
+        description: |
+          Warn (annotation + job summary) when one run's test archives add
+          up to more than this many MiB. Every archive is uploaded once and
+          each lane downloads its own; on trading's runners that moved about
+          9 MB/s up, so 9 GB of archives cost 17 minutes before any lane
+          started. The fixes: fewer test binaries (each statically links the
+          whole dependency graph), `CARGO_PROFILE_TEST_STRIP=debuginfo` in
+          `cargo-tests-build-env` (about 28 % smaller, at the cost of line
+          numbers in backtraces), or `cargo-tests-build-once: false`.
+      cargo-tests-archive-retention-days:
+        type: number
+        default: 1
+        description: |
+          Retention of the test-archive artifacts. A lane re-run after they
+          expired builds its own test binaries (with a warning).
+      cargo-tests-archive-cleanup:
+        type: boolean
+        default: true
+        description: |
+          Delete the run's test archives once every cargo-tests lane has
+          succeeded (`cargo-tests-archive-cleanup` job); keep them when a
+          lane failed or the run was cancelled, so "Re-run failed jobs"
+          still finds them (retention removes them later). Deleting needs
+          `actions: write` on the token the CALLER grants: a called
+          workflow can't raise its caller's permissions, and a job here that
+          asked for it would stop every caller that doesn't grant it from
+          starting. Without it the job says so in a notice and passes; the
+          archives then expire after `cargo-tests-archive-retention-days`.
       enable-openapi-drift:
         type: boolean
         default: false
@@ -276,6 +410,9 @@ jobs:
     container: ${{ inputs.container-image || null }}
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      # v3: the cargo-tests plan (see the `cargo-tests plan` step).
+      cargo-tests-lanes: ${{ steps.cargo-tests-plan.outputs.lanes }}
+      cargo-tests-archive: ${{ steps.cargo-tests-plan.outputs.archive }}
     steps:
       - uses: actions/checkout@v5
 
@@ -296,6 +433,274 @@ jobs:
         id: filter
         with:
           filters: ${{ steps.build-filter.outputs.filters }}
+
+      # ── cargo-tests: the lane gates and the build-once plan (v3) ─────
+      # Each lane's own `code-paths`, evaluated here once with the rules
+      # `cargo-tests.yml` has always applied (pull requests only; a filter
+      # with no verdict runs the lane). The archive job and the lanes
+      # consume only these verdicts: there is no separate build filter.
+      - name: cargo-tests lane filters
+        id: lane-filter-config
+        if: inputs.enable-cargo-tests && github.event_name == 'pull_request'
+        shell: bash
+        env:
+          CT_JSON: ${{ inputs.cargo-tests }}
+        run: |
+          set -euo pipefail
+          command -v jq >/dev/null 2>&1 || { echo "jq not found; the plan will fall back to v2 behaviour"; exit 0; }
+          filters=$(jq -r '
+            to_entries[]
+            | select((.value | type) == "object" and ((.value["code-paths"] // "") | tostring | length) > 0)
+            | "lane_\(.key):", ((.value["code-paths"] | tostring) | split("\n")[] | select(length > 0) | "  - " + @json)
+          ' <<<"$CT_JSON" 2>/dev/null || true)
+          [ -z "$filters" ] && exit 0
+          {
+            echo "filters<<CARGO_TESTS_EOF"
+            printf '%s\n' "$filters"
+            echo "CARGO_TESTS_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: cargo-tests lane path filters
+        id: lane-filter
+        if: steps.lane-filter-config.outputs.filters != ''
+        continue-on-error: true
+        uses: dorny/paths-filter@v4
+        with:
+          filters: ${{ steps.lane-filter-config.outputs.filters }}
+
+      - name: cargo-tests plan
+        id: cargo-tests-plan
+        if: inputs.enable-cargo-tests
+        shell: bash
+        env:
+          CT_JSON: ${{ inputs.cargo-tests }}
+          CT_BUILD_ONCE: ${{ inputs.cargo-tests-build-once }}
+          CT_MANIFEST: ${{ inputs.cargo-tests-manifest-path }}
+          CT_BUILD_JOBS: ${{ inputs.cargo-tests-build-jobs }}
+          CT_BUILD_ENV: ${{ inputs.cargo-tests-build-env }}
+          CT_BUILD_WRAPPER: ${{ inputs.cargo-tests-build-wrapper }}
+          CT_FEATURE_CHECK: ${{ inputs.cargo-tests-feature-check }}
+          HASH_SEED: ${{ inputs.container-image }} ${{ inputs.rust-version }} ${{ inputs.tag-prefix }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          LANE_FILTER_OUTCOME: ${{ steps.lane-filter.outcome }}
+          LANE_MATCHED: ${{ steps.lane-filter.outputs.changes }}
+        run: |
+          set -euo pipefail -f
+          # The cargo-tests plan: which lanes run, which run from the shared
+          # archive, and what the archive holds. Reads only the inputs and the
+          # per-lane path-filter verdicts above. Writes `lanes` (the matrix) and
+          # `archive` (the archive job's work order) to $GITHUB_OUTPUT.
+          out() { printf '%s=%s\n' "$1" "$2" >> "$GITHUB_OUTPUT"; }
+          seterr() { if [ -z "$err" ]; then err="$1"; fi; }
+          sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "::warning title=cargo-tests::jq is not in the job image, so the pipeline can't plan build-once: every lane builds and tests in its own pod (v2 behaviour)."
+            out lanes "$(printf '%s' "$CT_JSON" | tr '\n' ' ')"
+            out archive '{"build":false}'
+            exit 0
+          fi
+          if ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"$CT_JSON"; then
+            echo "::error title=cargo-tests::the cargo-tests input is not a JSON array"
+            exit 1
+          fi
+
+          # Top-level build settings: validate once.
+          if [ -n "$CT_FEATURE_CHECK" ] && ! printf '%s' "$CT_FEATURE_CHECK" | grep -qxE 'report|strict|off'; then
+            echo "::error title=cargo-tests::cargo-tests-feature-check must be report, strict or off (got '$CT_FEATURE_CHECK')"
+            exit 1
+          fi
+          build_exports=""
+          while IFS= read -r line; do
+            line="${line#"${line%%[![:space:]]*}"}"; line="${line%"${line##*[![:space:]]}"}"
+            [ -z "$line" ] && continue
+            case "$line" in \#*) continue ;; esac
+            k="${line%%=*}"; v="${line#*=}"
+            if [ "$k" = "$line" ] || ! printf '%s' "$k" | grep -qxE '[A-Za-z_][A-Za-z0-9_]*'; then
+              echo "::error title=cargo-tests::cargo-tests-build-env: '$line' is not KEY=VALUE"
+              exit 1
+            fi
+            build_exports+="export $k=$(sq "$v")"$'\n'
+          done <<<"$CT_BUILD_ENV"
+          manifest="\"\$GITHUB_WORKSPACE\"/$(sq "$CT_MANIFEST")"
+
+          nextest=false
+          # cargo finds subcommands on PATH and in $CARGO_HOME/bin.
+          if command -v cargo-nextest >/dev/null 2>&1 || [ -x "${CARGO_HOME:-$HOME/.cargo}/bin/cargo-nextest" ]; then
+            nextest=true
+          fi
+
+          # The per-lane path filters (pull requests only; any doubt runs the lane).
+          matched='[]'; filter_ok=false
+          if [ "$LANE_FILTER_OUTCOME" = success ] && jq -e 'type == "array"' >/dev/null 2>&1 <<<"${LANE_MATCHED:-}"; then
+            matched="$LANE_MATCHED"; filter_ok=true
+          fi
+
+          n=$(jq 'length' <<<"$CT_JSON")
+          lanes='[]'; names=' '
+          declare -a L_NAME L_MODE L_WHY L_RUN L_RUNWHY L_PKGS L_FEATS L_DOC L_CMD L_ACMD L_ENTRY
+          cands=()
+          for ((i = 0; i < n; i++)); do
+            e=$(jq -c ".[$i]" <<<"$CT_JSON")
+            f() { jq -r --arg k "$1" 'if (type == "object") and has($k) and .[$k] != null then (.[$k] | tostring) else "" end' <<<"$e"; }
+            has() { jq -e --arg k "$1" '(type == "object") and has($k)' >/dev/null <<<"$e"; }
+            name=$(f name); cmd=$(f command); err=""
+            if [ -z "$name" ]; then name="entry $i"; err="the entry has no name"; fi
+            case "$names" in *" $name "*) err="two entries are named '$name'" ;; esac
+            names+="$name "
+
+            # Triggered? v2's lane gate, evaluated here once.
+            cp=$(f code-paths)
+            if [ "$EVENT_NAME" = push ] && [ -n "$DEFAULT_BRANCH" ] && [ "$REF_NAME" = "$DEFAULT_BRANCH" ]; then
+              run=true; runwhy="push to the default branch ($DEFAULT_BRANCH); D1 fast-lane bypassed"
+            elif [ "$EVENT_NAME" != pull_request ]; then
+              run=true; runwhy="event '$EVENT_NAME' is not a pull_request; D1 fast-lane does not apply"
+            elif [ -z "$cp" ]; then
+              run=true; runwhy="no code-paths filter configured"
+            elif [ "$filter_ok" != true ]; then
+              run=true; runwhy="path filter reached no verdict; running anyway (fail-open)"
+            elif jq -e --arg k "lane_$i" 'index($k) != null' >/dev/null <<<"$matched"; then
+              run=true; runwhy="code-paths matched the pull-request diff"
+            else
+              run=false; runwhy="no file in the pull-request diff matched code-paths"
+            fi
+
+            pkgs=""; feats=""; doc=false; acmd=""; structured=false; once=true
+            if has packages; then
+              structured=true
+              pkgs=$(f packages | tr '\n\t,' '   ' | awk '{$1=$1};1')
+              feats=$(f features | tr '\n\t' '  ' | awk '{$1=$1};1')
+              profile=$(f profile); filter=$(f filter); nargs=$(f nextest-args | tr '\n' ' ' | awk '{$1=$1};1')
+              setup=$(f setup); twrap=$(f test-wrapper)
+              [ -z "$pkgs" ] && seterr "packages is empty"
+              for p in $pkgs; do
+                printf '%s' "$p" | grep -qxE '[A-Za-z0-9_][A-Za-z0-9_.@:+-]*' || seterr "'$p' is not a package name"
+              done
+              case "$(f doctests)" in true) doc=true ;; ''|false) ;; *) seterr "doctests must be 'true' or 'false'" ;; esac
+              case "$(f build-once)" in false) once=false ;; ''|true) ;; *) seterr "build-once must be 'true' or 'false'" ;; esac
+              [ -n "$profile" ] && ! printf '%s' "$profile" | grep -qxE '[A-Za-z0-9_.-]+' && seterr "'$profile' is not a nextest profile name"
+              for t in $nargs; do
+                case "$t" in
+                  -p*|--package|--package=*|--workspace|--all|--exclude|--exclude=*) seterr "nextest-args: '$t' — list the lane's packages in 'packages'" ;;
+                  -E*|--filterset|--filterset=*|--filter-expr|--filter-expr=*) seterr "nextest-args: '$t' — put the filterset in 'filter'" ;;
+                  -F*|--features|--features=*|--all-features|--no-default-features) seterr "nextest-args: '$t' — use 'features' (a lane that needs --all-features/--no-default-features sets build-once: 'false' and a 'command')" ;;
+                  -P*|--profile|--profile=*) seterr "nextest-args: '$t' — use 'profile'" ;;
+                  --manifest-path|--manifest-path=*|--archive-file|--archive-file=*|--cargo-metadata*|--binaries-metadata*|--workspace-remap*|--target-dir-remap*|--extract-to*)
+                    seterr "nextest-args: '$t' is set by the pipeline" ;;
+                esac
+              done
+              if has build-jobs; then jobs=$(f build-jobs); else jobs="$CT_BUILD_JOBS"; fi
+              [ -n "$jobs" ] && ! printf '%s' "$jobs" | grep -qxE '[1-9][0-9]*' && seterr "build-jobs must be a positive integer or ''"
+
+              sel="--manifest-path $manifest"
+              for p in $pkgs; do sel+=" -p $(sq "$p")"; done
+              [ -n "$feats" ] && sel+=" --features $(sq "$feats")"
+              prof=""; [ -n "$profile" ] && prof=" --profile $(sq "$profile")"
+
+              # The command the lane runs when it builds itself.
+              if [ -z "$cmd" ]; then
+                [ -n "$jobs" ] && cmd+="export CARGO_BUILD_JOBS=$jobs"$'\n'
+                cmd+="$build_exports"
+                [ -n "$setup" ] && cmd+="$setup"$'\n'
+                [ -n "$CT_BUILD_WRAPPER" ] && cmd+="$CT_BUILD_WRAPPER cargo nextest run --no-run $sel$prof"$'\n'
+                cmd+="${twrap:+$twrap }cargo nextest run $sel$prof${filter:+ -E $(sq "$filter")}${nargs:+ $nargs}"$'\n'
+                [ "$doc" = true ] && cmd+="cargo test --doc $sel"$'\n'
+              fi
+
+              # The command the lane runs from the archive: its partition only.
+              expr=""
+              for p in $pkgs; do expr+="${expr:+ | }package(=$p)"; done
+              [ -n "$filter" ] && expr="($expr) & ($filter)"
+              [ -n "$setup" ] && acmd+="$setup"$'\n'
+              acmd+="${twrap:+$twrap }cargo nextest run"
+              acmd+=" --binaries-metadata \"\$CARGO_TESTS_TARGET_DIR/nextest/binaries-metadata.json\""
+              acmd+=" --cargo-metadata \"\$CARGO_TESTS_TARGET_DIR/nextest/cargo-metadata.json\""
+              acmd+=" --target-dir-remap \"\$CARGO_TESTS_TARGET_DIR\" --workspace-remap \"\$CARGO_TESTS_WORKSPACE\""
+              acmd+="$prof -E $(sq "$expr")${nargs:+ $nargs}"$'\n'
+            fi
+            [ -z "$err" ] && [ -z "$cmd" ] && err="the entry has neither 'command' nor 'packages'"
+
+            if [ -n "$err" ]; then
+              mode=invalid; why="$err"; run=true; runwhy="the entry is invalid"
+              cmd="echo $(sq "::error title=cargo-tests ($name)::$err"); exit 1"; acmd=""
+            elif [ "$run" != true ]; then
+              mode=skip; why="not triggered"
+            elif [ "$structured" != true ]; then
+              mode=lane; why="no 'packages': the pipeline can't tell what a free-form command builds"
+            elif [ "$CT_BUILD_ONCE" != true ]; then
+              mode=lane; why="cargo-tests-build-once: false"
+            elif [ "$once" != true ]; then
+              mode=lane; why="the entry sets build-once: 'false'"
+            elif [ "$nextest" != true ]; then
+              mode=lane; why="cargo-nextest is not in the job image"
+            else
+              mode=archive; why="runs its partition of the shared archive"; cands+=("$i")
+            fi
+            L_NAME[i]="$name"; L_MODE[i]="$mode"; L_WHY[i]="$why"; L_RUN[i]="$run"; L_RUNWHY[i]="$runwhy"
+            L_PKGS[i]="$pkgs"; L_FEATS[i]="$feats"; L_DOC[i]="$doc"; L_CMD[i]="$cmd"; L_ACMD[i]="$acmd"; L_ENTRY[i]="$e"
+          done
+
+          if [ "${#cands[@]}" -eq 1 ]; then
+            i="${cands[0]}"; L_MODE[i]=lane; L_WHY[i]="the only lane that would run from an archive: nothing to share"; cands=()
+          fi
+
+          # The archive: the union of the triggered archive lanes' packages and features.
+          apkgs=""; afeats=""; adoc=false; alanes='[]'; lanepk='{}'; lanefeat='{}'; doclanes='{}'
+          for i in "${cands[@]}"; do
+            for p in ${L_PKGS[i]}; do case " $apkgs " in *" $p "*) ;; *) apkgs+="${apkgs:+ }$p" ;; esac; done
+            for x in ${L_FEATS[i]//,/ }; do case " $afeats " in *" $x "*) ;; *) afeats+="${afeats:+ }$x" ;; esac; done
+            alanes=$(jq -c --arg n "${L_NAME[i]}" '. + [$n]' <<<"$alanes")
+            lanepk=$(jq -c --arg n "${L_NAME[i]}" --arg v "${L_PKGS[i]}" '. + {($n): $v}' <<<"$lanepk")
+            lanefeat=$(jq -c --arg n "${L_NAME[i]}" --arg v "${L_FEATS[i]}" '. + {($n): $v}' <<<"$lanefeat")
+            if [ "${L_DOC[i]}" = true ]; then
+              adoc=true; doclanes=$(jq -c --arg n "${L_NAME[i]}" --arg v "${L_PKGS[i]}" '. + {($n): $v}' <<<"$doclanes")
+            fi
+          done
+          build=false; [ "${#cands[@]}" -ge 2 ] && build=true
+          artifact="cargo-tests-archive-$(printf '%s\n' "$CT_JSON" "$CT_MANIFEST" "$CT_BUILD_ENV" "$CT_BUILD_JOBS" "$CT_BUILD_WRAPPER" "$HASH_SEED" | sha256sum | cut -c1-12)"
+
+          for ((i = 0; i < n; i++)); do
+            lanes=$(jq -c \
+              --argjson e "${L_ENTRY[i]}" --arg name "${L_NAME[i]}" --arg mode "${L_MODE[i]}" --arg why "${L_WHY[i]}" \
+              --arg run "${L_RUN[i]}" --arg runwhy "${L_RUNWHY[i]}" --arg cmd "${L_CMD[i]}" --arg acmd "${L_ACMD[i]}" \
+              --arg doc "${L_DOC[i]}" \
+              '. + [{
+                 "name": $name,
+                 "with-postgres": (($e["with-postgres"] // "false") | tostring),
+                 "postgres-image": (($e["postgres-image"] // "postgres:18") | tostring),
+                 "pre-test-script": (($e["pre-test-script"] // "") | tostring),
+                 "init-sql": (($e["init-sql"] // "") | tostring),
+                 "code-paths": (($e["code-paths"] // "") | tostring),
+                 "working-directory": (($e["working-directory"] // ".") | tostring),
+                 "run": $run, "run-reason": $runwhy, "mode": $mode, "mode-reason": $why,
+                 "command": $cmd, "archive-command": $acmd, "doctests": $doc
+               }]' <<<"$lanes")
+          done
+          archive=$(jq -nc --argjson build "$build" --arg artifact "$artifact" --arg pkgs "$apkgs" --arg feats "$afeats" \
+            --argjson doc "$adoc" --argjson lanes "$alanes" --argjson lanepk "$lanepk" --argjson lanefeat "$lanefeat" \
+            --argjson doclanes "$doclanes" \
+            '{build: $build, artifact: $artifact, packages: $pkgs, features: $feats, doctests: $doc,
+              lanes: $lanes, "lane-packages": $lanepk, "lane-features": $lanefeat, "doctest-lanes": $doclanes}')
+          out lanes "$lanes"
+          out archive "$archive"
+
+          {
+            echo "## cargo-tests plan"
+            echo
+            if [ "$build" = true ]; then
+              echo "Build once: \`cargo-tests-archive\` archives \`${apkgs}\`${afeats:+ (features \`$afeats\`)} for ${#cands[@]} lanes."
+            else
+              echo "No shared archive in this run: every lane that runs builds its own test binaries."
+            fi
+            echo
+            echo "| Lane | Runs | Why | How | Why |"
+            echo "|---|---|---|---|---|"
+            for ((i = 0; i < n; i++)); do
+              echo "| ${L_NAME[i]} | ${L_RUN[i]} | ${L_RUNWHY[i]} | ${L_MODE[i]} | ${L_WHY[i]} |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
 
   build:
     needs: changes
@@ -370,20 +775,498 @@ jobs:
           name: binary
           path: target/release/${{ inputs.binary-name }}
 
-  # Matrix-driven cargo test splits — see `enable-cargo-tests` /
-  # `cargo-tests` inputs. Each entry gets its own status check named
-  # after `entry.name`. The chain-gate toggles on `serialize-jobs` do
-  # NOT apply here: cargo-tests entries are independent of each other
-  # and of the openapi-drift / web-build chain by design — a caller
-  # that wants a cargo-tests gate on openapi-drift / web-build should
-  # add an explicit `needs:` once they land in a future revision of
-  # this workflow.
-  cargo-tests:
+  # ── cargo-tests: build once (v3) ─────────────────────────────────────
+  # The test binaries of every TRIGGERED lane that runs from the archive
+  # (the `changes` job's plan: two or more such lanes, else this job is
+  # skipped), built once with `cargo nextest archive`, uploaded as an
+  # artifact of the run, then the doc tests against the same build.
+  # Same job-level gate as the lanes below. The check is
+  # `cargo-tests-archive`, which can't collide with a lane's
+  # `cargo-tests (<name>) / <name>`.
+  cargo-tests-archive:
+    name: cargo-tests-archive
     needs: changes
+    if: >-
+      inputs.enable-cargo-tests &&
+      fromJson(needs.changes.outputs.cargo-tests-archive || '{"build":false}').build &&
+      (startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix)) ||
+      github.event_name == 'pull_request' ||
+      needs.changes.outputs.code == 'true' ||
+      (github.event_name == 'push' &&
+       github.ref_name == github.event.repository.default_branch))
+    runs-on: ${{ inputs.runner }}
+    container: ${{ inputs.container-image || null }}
+    outputs:
+      status: ${{ steps.ready.outputs.status || steps.features.outputs.status }}
+      excluded: ${{ steps.features.outputs.excluded }}
+      lane-archives: ${{ steps.archive.outputs.lane-archives }}
+      target-dir: ${{ steps.archive.outputs.target-dir }}
+      workspace-root: ${{ steps.archive.outputs.workspace-root }}
+      github-workspace: ${{ steps.archive.outputs.github-workspace }}
+      doctests: ${{ steps.doctests.outputs.doctests }}
+    env:
+      ARCHIVE_PLAN: ${{ needs.changes.outputs.cargo-tests-archive }}
+      CT_MANIFEST: ${{ inputs.cargo-tests-manifest-path }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Mark workspace safe
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Setup Rust
+        uses: jcttech/.github/.github/actions/rust-setup@v1
+        with:
+          rust-version: ${{ inputs.rust-version }}
+
+      - name: Configure cargo for private git deps
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          if [ -z "$PRIVATE_REPO_TOKEN" ]; then
+            echo "PRIVATE_REPO_TOKEN not set; cargo will use anonymous git access only"
+            exit 0
+          fi
+          git config --global url."https://x-access-token:${PRIVATE_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
+          echo "CARGO_NET_GIT_FETCH_WITH_CLI=true" >> "$GITHUB_ENV"
+          echo "Configured private git auth via PRIVATE_REPO_TOKEN for cargo fetch"
+
+      - name: Enable sccache recache
+        if: inputs.sccache-recache
+        run: echo "SCCACHE_RECACHE=true" >> "$GITHUB_ENV"
+
+      - name: Build environment
+        shell: bash
+        env:
+          CT_BUILD_JOBS: ${{ inputs.cargo-tests-build-jobs }}
+          CT_BUILD_ENV: ${{ inputs.cargo-tests-build-env }}
+        run: |
+          set -euo pipefail
+          # Validated by the plan: KEY=VALUE lines.
+          {
+            [ -n "$CT_BUILD_JOBS" ] && echo "CARGO_BUILD_JOBS=$CT_BUILD_JOBS"
+            printf '%s\n' "$CT_BUILD_ENV" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d' -e '/^#/d'
+          } | tee -a "$GITHUB_ENV"
+
+      - name: Feature unification check
+        id: features
+        shell: bash
+        env:
+          CT_FEATURE_CHECK: ${{ inputs.cargo-tests-feature-check }}
+        run: |
+          set -uo pipefail -f
+          # Advisory: no failure in here may fail the build. Without -e, a
+          # failed resolution or comparison skips the check (`ok=false`) and
+          # the archive is shared as planned. C collation, so `sort` and
+          # `join` agree on the order whatever the image's locale.
+          export LC_ALL=C
+          # Which lanes share the archive, after the feature-unification check.
+          # Cargo unifies features across every package of one build, so a lane's
+          # crates can compile with more features in the union than in a build of
+          # that lane alone. `report` lists the workspace crates that differ;
+          # `strict` gives those lanes their own build (until the rest agree).
+          out() { printf '%s=%s\n' "$1" "$2" >> "$GITHUB_OUTPUT"; }
+          manifest="$GITHUB_WORKSPACE/$CT_MANIFEST"
+          mapfile -t lanes < <(jq -r '.lanes[]' <<<"$ARCHIVE_PLAN")
+          planned=("${lanes[@]}")
+          lpk() { jq -r --arg n "$1" '.["lane-packages"][$n]' <<<"$ARCHIVE_PLAN"; }
+          lft() { jq -r --arg n "$1" '.["lane-features"][$n] // ""' <<<"$ARCHIVE_PLAN"; }
+          union() { # lane names -> "packages|features"
+            local p="" f="" n x
+            for n in "$@"; do
+              for x in $(lpk "$n"); do case " $p " in *" $x "*) ;; *) p+="${p:+ }$x" ;; esac; done
+              for x in $(lft "$n" | tr ',' ' '); do case " $f " in *" $x "*) ;; *) f+="${f:+ }$x" ;; esac; done
+            done
+            printf '%s|%s' "$p" "$f"
+          }
+          # One line per package node: "<id>|<features>", features of every build
+          # of it (host/target) joined with ';'.
+          resolve() { # packages features
+            local a=() p
+            for p in $1; do a+=(-p "$p"); done
+            [ -n "$2" ] && a+=(--features "$2")
+            cargo tree --manifest-path "$manifest" -e normal,build,dev --prefix none -f '{p}|{f}' "${a[@]}" \
+              | sed 's/ (\*)$//' | sort -u \
+              | awk -F'|' '$1 != "" { k = $1; v[k] = (k in v) ? v[k] ";" $2 : $2 } END { for (k in v) print k "|" v[k] }' | sort -t'|' -k1,1
+          }
+
+          excluded=()
+          declare -A diffs_all diffs_ws
+          if [ "$CT_FEATURE_CHECK" != off ] && [ "${#lanes[@]}" -ge 2 ]; then
+            ok=true
+            while :; do
+              u=$(union "${lanes[@]}"); upk="${u%%|*}"; uft="${u#*|}"
+              if ! U=$(resolve "$upk" "$uft"); then ok=false; break; fi
+              changed=false; keep=()
+              for n in "${lanes[@]}"; do
+                if ! A=$(resolve "$(lpk "$n")" "$(lft "$n")"); then ok=false; break 2; fi
+                if ! d=$(join -t'|' -j1 <(printf '%s\n' "$A") <(printf '%s\n' "$U") | awk -F'|' '$2 != $3 { print $1 "|" $2 "|" $3 }'); then
+                  ok=false; break 2
+                fi
+                diffs_all[$n]=$(printf '%s' "$d" | grep -c . || true)
+                diffs_ws[$n]=$(printf '%s\n' "$d" | grep -F "($GITHUB_WORKSPACE/" \
+                  | sed -E "s#^([^ ]+) [^|]*\|([^|]*)\|(.*)\$#\1: alone [\2] / shared [\3]#; s/\[;/[/g; s/;\]/]/g" || true)
+                if [ "$CT_FEATURE_CHECK" = strict ] && [ -n "${diffs_ws[$n]}" ]; then
+                  excluded+=("$n"); changed=true
+                else
+                  keep+=("$n")
+                fi
+              done
+              lanes=("${keep[@]}")
+              { [ "$changed" = true ] && [ "${#lanes[@]}" -ge 2 ]; } || break
+            done
+            if [ "$ok" != true ]; then
+              echo "::warning title=cargo-tests::the feature-unification check could not run (cargo tree or the comparison failed), so the archive is shared as planned"
+              lanes=("${planned[@]}"); excluded=()
+            fi
+          fi
+          if [ "${#lanes[@]}" -lt 2 ]; then
+            excluded+=("${lanes[@]}"); lanes=()
+          fi
+          u=$(union "${lanes[@]}"); upk="${u%%|*}"; uft="${u#*|}"
+          out packages "$upk"
+          out features "$uft"
+          if [ "${#lanes[@]}" -ge 2 ]; then out build true; else out build false; out status none; fi
+          out lanes "$(printf '%s\n' "${lanes[@]}" | jq -R . | jq -sc 'map(select(length > 0))')"
+          out excluded "$(printf '%s\n' "${excluded[@]}" | jq -R . | jq -sc 'map(select(length > 0))')"
+
+          {
+            echo "## cargo-tests: feature unification (\`cargo-tests-feature-check: $CT_FEATURE_CHECK\`)"
+            echo
+            if [ "$CT_FEATURE_CHECK" = off ]; then
+              echo "Not checked."
+            else
+              echo "Cargo unifies features across the packages of one build. Per lane: the crates that compile with other features in the shared archive than in a build of that lane alone."
+              echo
+              echo "| Lane | Crates that differ | Workspace crates that differ | Shares the archive |"
+              echo "|---|---|---|---|"
+              for n in "${planned[@]}"; do
+                ws="${diffs_ws[$n]:-}"; ws="${ws//$'\n'/<br>}"
+                case " ${excluded[*]} " in *" $n "*) s=no ;; *) s=yes ;; esac
+                echo "| $n | ${diffs_all[$n]:-?} | ${ws:-none} | $s |"
+              done
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # One build (the union's -p/--features selection, so every lane's
+      # crates are compiled exactly once and agree on features), then one
+      # archive per lane holding only its packages' binaries, so a lane
+      # downloads and extracts its own partition, not everyone's (trading
+      # run 43058297492: one 9.2 GB archive pulled by five lanes). The
+      # first `cargo nextest archive` builds everything; the rest only
+      # re-archive (cargo has nothing left to do).
+      - name: Build the test archives
+        id: archive
+        if: steps.features.outputs.build == 'true'
+        shell: bash
+        env:
+          ARTIFACT: ${{ fromJson(needs.changes.outputs.cargo-tests-archive).artifact }}
+          PKGS: ${{ steps.features.outputs.packages }}
+          FEATS: ${{ steps.features.outputs.features }}
+          ARCHIVE_LANES: ${{ steps.features.outputs.lanes }}
+          CT_BUILD_WRAPPER: ${{ inputs.cargo-tests-build-wrapper }}
+        run: |
+          set -euo pipefail -f
+          slots=12   # upload steps below; lanes beyond that share a slot's artifact
+          manifest="$GITHUB_WORKSPACE/$CT_MANIFEST"
+          dir="$RUNNER_TEMP/cargo-tests-archive"; rm -rf "$dir"; mkdir -p "$dir"
+          a=(); for p in $PKGS; do a+=(-p "$p"); done
+          [ -n "$FEATS" ] && a+=(--features "$FEATS")
+          mapfile -t lanes < <(jq -r '.[]' <<<"$ARCHIVE_LANES")
+          lanepk() { jq -r --arg n "$1" '.["lane-packages"][$n]' <<<"$ARCHIVE_PLAN"; }
+          archives='{}'; rows=""; total=0; build_secs=0
+          start=$(date +%s)
+          for k in "${!lanes[@]}"; do
+            n="${lanes[$k]}"; slot=$(( k % slots )); mkdir -p "$dir/slot-$slot"
+            file="lane-$k.tar.zst"
+            expr=""; for p in $(lanepk "$n"); do expr+="${expr:+ | }package(=$p)"; done
+            set -- cargo nextest archive --manifest-path "$manifest" "${a[@]}" -E "$expr" --archive-file "$dir/slot-$slot/$file"
+            t0=$(date +%s)
+            if [ "$k" -eq 0 ]; then
+              echo "Building once for ${#lanes[@]} lanes: ${CT_BUILD_WRAPPER:+$CT_BUILD_WRAPPER }$* (CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-unset})"
+              if [ -n "$CT_BUILD_WRAPPER" ]; then eval "$CT_BUILD_WRAPPER \"\$@\""; else "$@"; fi
+              build_secs=$(( $(date +%s) - t0 ))
+            else
+              echo "Archiving lane $n: $*"
+              "$@"
+            fi
+            size=$(stat -c %s "$dir/slot-$slot/$file"); total=$(( total + size ))
+            echo "slot-$slot=true" >> "$GITHUB_OUTPUT"
+            archives=$(jq -c --arg n "$n" --arg a "$ARTIFACT-$slot" --arg f "$file" '. + {($n): {artifact: $a, file: $f}}' <<<"$archives")
+            rows+="| $n | \`$expr\` | $(awk -v b="$size" 'BEGIN { printf "%.0f MiB", b / 1048576 }') | $(( $(date +%s) - t0 ))s |"$'\n'
+          done
+          secs=$(( $(date +%s) - start ))
+          meta=$(cargo metadata --no-deps --format-version 1 --manifest-path "$manifest")
+          echo "CARGO_TESTS_UPLOAD_T0=$(date +%s)" >> "$GITHUB_ENV"
+          {
+            echo "dir=$dir"
+            echo "total-bytes=$total"
+            echo "lane-archives=$archives"
+            echo "target-dir=$(jq -r .target_directory <<<"$meta")"
+            echo "workspace-root=$(jq -r .workspace_root <<<"$meta")"
+            echo "github-workspace=$GITHUB_WORKSPACE"
+          } >> "$GITHUB_OUTPUT"
+          mib() { awk -v b="$1" 'BEGIN { printf "%.0f MiB", b / 1048576 }'; }
+          {
+            echo "## cargo-tests archive"
+            echo
+            echo "Built once: \`$PKGS\`${FEATS:+, features \`$FEATS\`}; CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-unset}; build $((build_secs / 60))m$((build_secs % 60))s, build + archives $((secs / 60))m$((secs % 60))s, $(mib "$total") in all."
+            echo
+            echo "| Lane | Archived binaries | Archive | Time |"
+            echo "|---|---|---|---|"
+            printf '%s' "$rows"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the test archive (slot 0)
+        if: steps.archive.outputs.slot-0 == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ fromJson(needs.changes.outputs.cargo-tests-archive).artifact }}-0
+          path: ${{ steps.archive.outputs.dir }}/slot-0
+          retention-days: ${{ inputs.cargo-tests-archive-retention-days }}
+          compression-level: 0   # already zstd
+          overwrite: true        # a re-run of this job replaces the earlier attempt's
+          if-no-files-found: error
+
+      - name: Upload the test archive (slot 1)
+        if: steps.archive.outputs.slot-1 == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ fromJson(needs.changes.outputs.cargo-tests-archive).artifact }}-1
+          path: ${{ steps.archive.outputs.dir }}/slot-1
+          retention-days: ${{ inputs.cargo-tests-archive-retention-days }}
+          compression-level: 0   # already zstd
+          overwrite: true        # a re-run of this job replaces the earlier attempt's
+          if-no-files-found: error
+
+      - name: Upload the test archive (slot 2)
+        if: steps.archive.outputs.slot-2 == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ fromJson(needs.changes.outputs.cargo-tests-archive).artifact }}-2
+          path: ${{ steps.archive.outputs.dir }}/slot-2
+          retention-days: ${{ inputs.cargo-tests-archive-retention-days }}
+          compression-level: 0   # already zstd
+          overwrite: true        # a re-run of this job replaces the earlier attempt's
+          if-no-files-found: error
+
+      - name: Upload the test archive (slot 3)
+        if: steps.archive.outputs.slot-3 == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ fromJson(needs.changes.outputs.cargo-tests-archive).artifact }}-3
+          path: ${{ steps.archive.outputs.dir }}/slot-3
+          retention-days: ${{ inputs.cargo-tests-archive-retention-days }}
+          compression-level: 0   # already zstd
+          overwrite: true        # a re-run of this job replaces the earlier attempt's
+          if-no-files-found: error
+
+      - name: Upload the test archive (slot 4)
+        if: steps.archive.outputs.slot-4 == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ fromJson(needs.changes.outputs.cargo-tests-archive).artifact }}-4
+          path: ${{ steps.archive.outputs.dir }}/slot-4
+          retention-days: ${{ inputs.cargo-tests-archive-retention-days }}
+          compression-level: 0   # already zstd
+          overwrite: true        # a re-run of this job replaces the earlier attempt's
+          if-no-files-found: error
+
+      - name: Upload the test archive (slot 5)
+        if: steps.archive.outputs.slot-5 == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ fromJson(needs.changes.outputs.cargo-tests-archive).artifact }}-5
+          path: ${{ steps.archive.outputs.dir }}/slot-5
+          retention-days: ${{ inputs.cargo-tests-archive-retention-days }}
+          compression-level: 0   # already zstd
+          overwrite: true        # a re-run of this job replaces the earlier attempt's
+          if-no-files-found: error
+
+      - name: Upload the test archive (slot 6)
+        if: steps.archive.outputs.slot-6 == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ fromJson(needs.changes.outputs.cargo-tests-archive).artifact }}-6
+          path: ${{ steps.archive.outputs.dir }}/slot-6
+          retention-days: ${{ inputs.cargo-tests-archive-retention-days }}
+          compression-level: 0   # already zstd
+          overwrite: true        # a re-run of this job replaces the earlier attempt's
+          if-no-files-found: error
+
+      - name: Upload the test archive (slot 7)
+        if: steps.archive.outputs.slot-7 == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ fromJson(needs.changes.outputs.cargo-tests-archive).artifact }}-7
+          path: ${{ steps.archive.outputs.dir }}/slot-7
+          retention-days: ${{ inputs.cargo-tests-archive-retention-days }}
+          compression-level: 0   # already zstd
+          overwrite: true        # a re-run of this job replaces the earlier attempt's
+          if-no-files-found: error
+
+      - name: Upload the test archive (slot 8)
+        if: steps.archive.outputs.slot-8 == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ fromJson(needs.changes.outputs.cargo-tests-archive).artifact }}-8
+          path: ${{ steps.archive.outputs.dir }}/slot-8
+          retention-days: ${{ inputs.cargo-tests-archive-retention-days }}
+          compression-level: 0   # already zstd
+          overwrite: true        # a re-run of this job replaces the earlier attempt's
+          if-no-files-found: error
+
+      - name: Upload the test archive (slot 9)
+        if: steps.archive.outputs.slot-9 == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ fromJson(needs.changes.outputs.cargo-tests-archive).artifact }}-9
+          path: ${{ steps.archive.outputs.dir }}/slot-9
+          retention-days: ${{ inputs.cargo-tests-archive-retention-days }}
+          compression-level: 0   # already zstd
+          overwrite: true        # a re-run of this job replaces the earlier attempt's
+          if-no-files-found: error
+
+      - name: Upload the test archive (slot 10)
+        if: steps.archive.outputs.slot-10 == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ fromJson(needs.changes.outputs.cargo-tests-archive).artifact }}-10
+          path: ${{ steps.archive.outputs.dir }}/slot-10
+          retention-days: ${{ inputs.cargo-tests-archive-retention-days }}
+          compression-level: 0   # already zstd
+          overwrite: true        # a re-run of this job replaces the earlier attempt's
+          if-no-files-found: error
+
+      - name: Upload the test archive (slot 11)
+        if: steps.archive.outputs.slot-11 == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ fromJson(needs.changes.outputs.cargo-tests-archive).artifact }}-11
+          path: ${{ steps.archive.outputs.dir }}/slot-11
+          retention-days: ${{ inputs.cargo-tests-archive-retention-days }}
+          compression-level: 0   # already zstd
+          overwrite: true        # a re-run of this job replaces the earlier attempt's
+          if-no-files-found: error
+
+      - name: Archive ready
+        id: ready
+        if: steps.archive.outcome == 'success'
+        shell: bash
+        env:
+          TOTAL: ${{ steps.archive.outputs.total-bytes }}
+          WARN_MIB: ${{ inputs.cargo-tests-archive-warn-mib }}
+        run: |
+          secs=$(( $(date +%s) - ${CARGO_TESTS_UPLOAD_T0:-$(date +%s)} ))
+          mib=$(( TOTAL / 1048576 ))
+          rate=$(awk -v b="$TOTAL" -v s="$secs" 'BEGIN { if (s > 0) printf "%.1f MB/s", b / s / 1e6; else print "n/a" }')
+          {
+            echo
+            echo "Uploaded ${mib} MiB of test archives in $((secs / 60))m$((secs % 60))s ($rate)."
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$mib" -gt "${WARN_MIB:-2048}" ]; then
+            msg="the test archives are ${mib} MiB (over cargo-tests-archive-warn-mib, ${WARN_MIB} MiB) and took $((secs / 60))m$((secs % 60))s to upload; every lane waits for that and then downloads its share. Fewer test binaries (each links the whole dependency graph) is the fix; CARGO_PROFILE_TEST_STRIP=debuginfo in cargo-tests-build-env saves about a quarter; cargo-tests-build-once: false goes back to per-lane builds."
+            echo "::warning title=cargo-tests archive size::$msg"
+            { echo; echo "> **Warning:** $msg"; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "status=ready" >> "$GITHUB_OUTPUT"
+
+      - name: Doc tests
+        id: doctests
+        if: >-
+          steps.archive.outcome == 'success' &&
+          fromJson(needs.changes.outputs.cargo-tests-archive).doctests
+        shell: bash
+        env:
+          PKGS: ${{ steps.features.outputs.packages }}
+          FEATS: ${{ steps.features.outputs.features }}
+          LANES: ${{ steps.features.outputs.lanes }}
+        run: |
+          set -uo pipefail -f
+          # The doc tests, run once against the archive's build: the same -p and
+          # --features selection as `cargo nextest archive`, so nothing recompiles.
+          # Each crate's result is attributed back to the lanes that asked for doc
+          # tests (`doctests: 'true'`); the lane's own check fails on it.
+          out() { printf '%s=%s\n' "$1" "$2" >> "$GITHUB_OUTPUT"; }
+          manifest="$GITHUB_WORKSPACE/$CT_MANIFEST"
+          log="$RUNNER_TEMP/cargo-tests-doctests.log"
+          a=(); for p in $PKGS; do a+=(-p "$p"); done
+          [ -n "$FEATS" ] && a+=(--features "$FEATS")
+
+          mapfile -t doclanes < <(jq -r --argjson keep "$LANES" '.["doctest-lanes"] | to_entries[] | select(.key as $k | $keep | index($k)) | .key' <<<"$ARCHIVE_PLAN")
+          if [ "${#doclanes[@]}" -eq 0 ]; then
+            echo "No lane in the archive asks for doc tests."
+            out doctests '{}'
+            exit 0
+          fi
+
+          start=$(date +%s)
+          CARGO_TERM_COLOR=never cargo test --doc --no-fail-fast --manifest-path "$manifest" "${a[@]}" 2>&1 | tee "$log"
+          rc=${PIPESTATUS[0]}
+          secs=$(( $(date +%s) - start ))
+
+          # crate name -> package
+          declare -A pkg_of
+          while IFS=$'\t' read -r c p; do pkg_of[$c]="$p"; done < <(
+            cargo metadata --no-deps --format-version 1 --manifest-path "$manifest" | jq -r '
+              .packages[] | .name as $p | .targets[]
+              | select(any(.kind[]; . == "lib" or . == "rlib" or . == "dylib" or . == "proc-macro"))
+              | "\(.name | gsub("-"; "_"))\t\($p)"')
+          failed=" "
+          while read -r c; do [ -n "$c" ] && failed+="${pkg_of[$c]:-$c} "; done < <(
+            awk '/^[[:space:]]*Doc-tests /{ c = $2 } /^test result: FAILED/{ print c }' "$log" | sort -u)
+          unattributed=false
+          [ "$rc" -ne 0 ] && [ "$failed" = " " ] && unattributed=true
+
+          verdicts='{}'; bad=false; requested=" "
+          for n in "${doclanes[@]}"; do
+            v=passed
+            for p in $(jq -r --arg n "$n" '.["doctest-lanes"][$n]' <<<"$ARCHIVE_PLAN"); do
+              requested+="$p "
+              case "$failed" in *" $p "*) v=failed ;; esac
+            done
+            [ "$unattributed" = true ] && v=failed
+            [ "$v" = failed ] && bad=true
+            verdicts=$(jq -c --arg n "$n" --arg v "$v" '. + {($n): $v}' <<<"$verdicts")
+          done
+          for p in $failed; do
+            case "$requested" in *" $p "*) ;; *) echo "::warning title=cargo-tests doc tests::$p's doc tests failed; no lane asks for them (doctests: 'true'), so nothing fails on it" ;; esac
+          done
+          out doctests "$verdicts"
+          {
+            echo "## cargo-tests: doc tests (${secs}s, exit $rc)"
+            echo
+            failed_list=$(printf '%s' "$failed" | awk '{$1=$1};1')
+            echo "Run once against the archive's build. Failed packages: \`${failed_list:-none}\`"
+            [ "$unattributed" = true ] && echo "cargo failed without a failing doc-test result to attribute: every lane that asked for doc tests fails."
+            echo
+            echo "| Lane | Doc tests |"
+            echo "|---|---|"
+            for n in "${doclanes[@]}"; do echo "| $n | $(jq -r --arg n "$n" '.[$n]' <<<"$verdicts") |"; done
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$bad" = true ]; then
+            echo "::error title=cargo-tests doc tests::doc tests failed for: $(jq -r 'to_entries | map(select(.value == "failed") | .key) | join(", ")' <<<"$verdicts") (see the log above; each of those lanes fails on it)"
+            exit 1
+          fi
+          exit 0
+
+  # Matrix-driven cargo test splits — see `enable-cargo-tests` /
+  # `cargo-tests` inputs. One lane per entry, each its own status check,
+  # `cargo-tests (<name>) / <name>` (an explicit job name: v2 rendered the
+  # whole matrix entry, command text included, into the middle part). The
+  # matrix is the `changes` job's plan: every entry, with its gate verdict,
+  # whether it runs from the archive, and its commands. A lane runs even
+  # when the archive job failed, so that it FAILS (pointing at that job)
+  # rather than being skipped. The chain-gate toggles on `serialize-jobs`
+  # do NOT apply here: cargo-tests entries are independent of each other
+  # and of the openapi-drift / web-build chain by design.
+  cargo-tests:
+    name: cargo-tests (${{ matrix.entry.name }})
+    needs: [changes, cargo-tests-archive]
     # The trailing `push`-to-default-branch clause bypasses the D1
     # fast-lane on the canonical ground-truth build (jcttech/trading#200
     # option 2). See the note above the `changes` job.
     if: >-
+      !cancelled() && needs.changes.result == 'success' &&
       inputs.enable-cargo-tests &&
       (startsWith(github.ref, format('refs/tags/{0}v', inputs.tag-prefix)) ||
       github.event_name == 'pull_request' ||
@@ -393,8 +1276,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        entry: ${{ fromJson(inputs.cargo-tests) }}
-    uses: jcttech/.github/.github/workflows/cargo-tests.yml@v2
+        entry: ${{ fromJson(needs.changes.outputs.cargo-tests-lanes || inputs.cargo-tests) }}
+    # Pinned to this workflow's own major: the lanes need the v3 inputs.
+    uses: jcttech/.github/.github/workflows/cargo-tests.yml@v3
     secrets: inherit
     with:
       # `${{ expr || 'default' }}` fallbacks here are load-bearing —
@@ -416,6 +1300,86 @@ jobs:
       runner: ${{ inputs.runner }}
       container-image: ${{ inputs.container-image }}
       rust-version: ${{ inputs.rust-version }}
+      should-run: ${{ matrix.entry.run || '' }}
+      should-run-reason: ${{ matrix.entry.run-reason || '' }}
+      # Archive lanes not moved off the archive by the feature check: their
+      # own artifact (one per lane). If the archive job failed there is none,
+      # and `archive-status` fails the lane.
+      archive-artifact: >-
+        ${{ (matrix.entry.mode == 'archive' &&
+             !contains(fromJson(needs.cargo-tests-archive.outputs.excluded || '[]'), matrix.entry.name) &&
+             (fromJson(needs.cargo-tests-archive.outputs.lane-archives || '{}')[matrix.entry.name].artifact ||
+              format('{0}-missing', fromJson(needs.changes.outputs.cargo-tests-archive).artifact))) || '' }}
+      archive-file: ${{ fromJson(needs.cargo-tests-archive.outputs.lane-archives || '{}')[matrix.entry.name].file || '' }}
+      archive-status: ${{ needs.cargo-tests-archive.outputs.status || needs.cargo-tests-archive.result }}
+      archive-command: ${{ matrix.entry.archive-command || '' }}
+      archive-target-dir: ${{ needs.cargo-tests-archive.outputs.target-dir }}
+      archive-workspace-root: ${{ needs.cargo-tests-archive.outputs.workspace-root }}
+      archive-github-workspace: ${{ needs.cargo-tests-archive.outputs.github-workspace }}
+      doctests-verdict: >-
+        ${{ (matrix.entry.mode == 'archive' && matrix.entry.doctests == 'true' &&
+             (fromJson(needs.cargo-tests-archive.outputs.doctests || '{}')[matrix.entry.name] || 'missing')) || '' }}
+
+
+  # ── cargo-tests: delete the run's archives once they've served (v3) ──
+  # Every lane passed: nothing will re-run, so the archives only cost
+  # Actions storage until retention removes them. Any lane failed or the
+  # run was cancelled: keep them for "Re-run failed jobs" (which re-runs
+  # this job after the lanes, so a green re-run deletes them then). The
+  # job never fails the run. No `permissions:` on purpose: a nested job
+  # can't be granted more than its caller's token, and asking for
+  # `actions: write` here would make every caller that doesn't grant it
+  # fail at startup, so it uses the caller's token as it comes and stops
+  # with a notice when that can't delete.
+  cargo-tests-archive-cleanup:
+    name: cargo-tests-archive-cleanup
+    needs: [changes, cargo-tests-archive, cargo-tests]
+    if: >-
+      !cancelled() && inputs.cargo-tests-archive-cleanup &&
+      needs.cargo-tests-archive.result == 'success' &&
+      needs.cargo-tests.result == 'success'
+    runs-on: ${{ inputs.runner }}
+    container: ${{ inputs.container-image || null }}
+    steps:
+      - name: Delete this run's test archives
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREFIX: ${{ fromJson(needs.changes.outputs.cargo-tests-archive).artifact }}-
+        run: |
+          set -uo pipefail
+          api="${GITHUB_API_URL:-https://api.github.com}/repos/$GITHUB_REPOSITORY/actions"
+          auth=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28")
+          note() {
+            echo "::notice title=cargo-tests archive cleanup::$1"
+            { echo "## cargo-tests archive cleanup"; echo; echo "$1"; } >> "$GITHUB_STEP_SUMMARY"
+          }
+          if ! list=$(curl -fsS "${auth[@]}" "$api/runs/$GITHUB_RUN_ID/artifacts?per_page=100"); then
+            note "Could not list this run's artifacts; the test archives stay until retention removes them."
+            exit 0
+          fi
+          mapfile -t rows < <(jq -r --arg p "$PREFIX" '.artifacts[] | select(.name | startswith($p)) | "\(.id) \(.size_in_bytes) \(.name)"' <<<"$list")
+          if [ "${#rows[@]}" -eq 0 ]; then
+            note "No test archives of this run left to delete."
+            exit 0
+          fi
+          deleted=0; bytes=0; denied=false
+          for r in "${rows[@]}"; do
+            read -r id size name <<<"$r"
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE "${auth[@]}" "$api/artifacts/$id" || echo 000)
+            case "$code" in
+              204) deleted=$((deleted + 1)); bytes=$((bytes + size)); echo "Deleted $name ($((size / 1048576)) MiB)." ;;
+              404) echo "$name is already gone." ;;
+              401|403) denied=true; break ;;
+              *) echo "::warning title=cargo-tests archive cleanup::deleting $name returned HTTP $code; it stays until retention removes it" ;;
+            esac
+          done
+          if [ "$denied" = true ]; then
+            note "The workflow token can't delete artifacts: grant \`actions: write\` to the job that calls rust-pipeline.yml to have the test archives deleted when every lane passes (or set cargo-tests-archive-cleanup: false to skip this job). They stay until cargo-tests-archive-retention-days removes them."
+          else
+            note "Every lane passed: deleted $deleted test archive(s), $((bytes / 1048576)) MiB."
+          fi
+          exit 0
 
   openapi-drift:
     needs: changes
@@ -477,7 +1441,7 @@ jobs:
       container-image: ${{ inputs.container-image }}
 
   docker:
-    needs: [changes, build, cargo-tests, openapi-drift, web-build]
+    needs: [changes, build, cargo-tests-archive, cargo-tests, openapi-drift, web-build]
     if: >-
       !failure() && !cancelled() &&
       inputs.enable-docker &&
@@ -551,7 +1515,7 @@ jobs:
           tag-prefix: ${{ inputs.tag-prefix }}
 
   release:
-    needs: [build, docker, cargo-tests, openapi-drift, web-build]
+    needs: [build, docker, cargo-tests-archive, cargo-tests, openapi-drift, web-build]
     if: >-
       !failure() && !cancelled() &&
       inputs.enable-release &&

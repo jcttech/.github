@@ -110,6 +110,56 @@ Complete CI/CD for Rust projects: change detection, build, clippy, test, Docker,
 | `web-build-container-image` | string | `ghcr.io/jcttech/devcontainer-rust-leptos:latest` | Container image for the web-build job pod (must carry the WASM toolchain) |
 | `web-build-code-paths` | string | `''` | D1 fast-lane glob list |
 
+**Cargo-tests sub-job (`cargo-tests.yml`, matrix; build once, run everywhere since `@v3`):**
+
+| Input | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enable-cargo-tests` | boolean | `false` | Opt into the matrix of test lanes (one status check per lane: `cargo-tests (<name>) / <name>`) |
+| `cargo-tests` | string | `[]` | JSON array of lanes (fields below) |
+| `cargo-tests-build-once` | boolean | `true` | Build the triggered structured lanes' test binaries once (`cargo-tests-archive` job, `cargo nextest archive`) and run every lane from the archive. `false`: every lane builds itself (v2 behaviour) |
+| `cargo-tests-manifest-path` | string | `Cargo.toml` | Repo-root-relative workspace manifest the structured lanes build from |
+| `cargo-tests-build-jobs` | string | `1` | `CARGO_BUILD_JOBS` for the archive build and for structured lanes that build themselves (`''` = unset). Conservative on purpose; raise it on measured memory headroom |
+| `cargo-tests-build-env` | string | `''` | `KEY=VALUE` lines exported for every build the pipeline composes (not for a free-form `command`) |
+| `cargo-tests-build-wrapper` | string | `''` | Prefix the archive build runs under (e.g. a memory probe) |
+| `cargo-tests-feature-check` | string | `report` | `report` / `strict` / `off` — Cargo unifies features across one build's packages; `report` lists the workspace crates whose features differ from a lane-alone build, `strict` builds such lanes on their own |
+| `cargo-tests-archive-warn-mib` | number | `2048` | Warn when one run's test archives exceed this many MiB (they're uploaded before any lane starts) |
+| `cargo-tests-archive-retention-days` | number | `1` | Retention of the archive artifacts; a lane re-run after expiry builds itself |
+| `cargo-tests-archive-cleanup` | boolean | `true` | Delete the run's archives once every lane passed (`cargo-tests-archive-cleanup` job); keep them for "Re-run failed jobs" when a lane failed or the run was cancelled. Needs `actions: write` granted by the **caller** (see below); without it the job leaves a notice and passes |
+
+Lane fields: `name` (required), `command`, `with-postgres`, `postgres-image`, `pre-test-script`, `init-sql`, `code-paths`, `working-directory` (as in v2), and the structured fields `packages` (the `-p` list; makes the lane eligible for the archive), `features`, `profile`, `filter` (nextest filterset, ANDed with the packages), `nextest-args`, `doctests` (`'true'`/`'false'`), `setup` (shell before the tests, same step), `test-wrapper`, `build-once` (`'false'` = always build itself), `build-jobs`.
+
+How a run goes: the `changes` job evaluates every lane's `code-paths` (pull requests only, fail-open) and plans each triggered lane as *archive* or *per-lane*. A lane builds itself when the pipeline opts out (`cargo-tests-build-once: false`), the lane opts out, it has no `packages` (a free-form `command` can't be shared), the image lacks `cargo-nextest`, fewer than two triggered lanes qualify, or `cargo-tests-feature-check: strict` moves it off. With two or more archive lanes, `cargo-tests-archive` builds the union of **their** packages and features once, writes one archive per lane (only that lane's packages' binaries), uploads each as an artifact, and runs `cargo test --doc` once against the same build (nextest archives carry no doc tests); each lane downloads its own archive, runs `cargo nextest run -E '(package(=…) | …) & (<filter>)'` from it, and fails on its own packages' doc-test result. A re-run of a failed lane reuses the archive. If the archive job fails, every archive lane fails with a pointer to it.
+
+Archive size is what decides whether this pays: every test binary statically links the whole dependency graph, the archives are uploaded before any lane starts, and the job summaries report sizes and transfer times every run. Fewer, larger test binaries (one integration-test binary per area) keep the archives small; `CARGO_PROFILE_TEST_STRIP=debuginfo` in `cargo-tests-build-env` cuts about a quarter at the cost of line numbers in backtraces (the panic's own `file:line` is kept). **Archive storage and cleanup.** The archives are Actions artifacts and count against the organisation's Actions storage. jcttech/trading's five lanes come to about 2.5 GB per run. With `cargo-tests-archive-cleanup` (the default) and `actions: write` granted, a green run deletes them as its last job, after about 20 minutes of storage. A failed or cancelled run keeps them for re-runs until `cargo-tests-archive-retention-days` (1 day) removes them. Without the grant every run keeps them for the day: about 2.5 GB-days per run. A called workflow can't raise its caller's token permissions, so the grant goes on the caller's job:
+
+```yaml
+jobs:
+  ci:
+    uses: jcttech/.github/.github/workflows/rust-pipeline.yml@v3
+    permissions:
+      contents: read
+      actions: write   # lets cargo-tests-archive-cleanup delete the run's test archives
+    secrets: inherit
+```
+
+(If the workflow sets `permissions:` at the top, add `actions: write` there or on the calling job; nested jobs only ever get what the caller's job has.)
+
+A nextest archive carries the tested packages' build-script outputs but not a dependency's: a test that reads a dependency's `OUT_DIR` at run time (rust-embed in debug builds, e.g. utoipa-swagger-ui's Swagger UI) needs the dependency to embed it (`debug-embed`) or nextest's `[profile.default.archive] include`. The archive build runs at `CARGO_BUILD_JOBS=1` unless raised: it links one binary at a time, so its memory peak is one heavy link (4.5 GiB of anonymous memory on jcttech/trading's largest workspace).
+
+```yaml
+      enable-cargo-tests: true
+      cargo-tests-manifest-path: app/Cargo.toml
+      cargo-tests-build-env: |
+        CARGO_PROFILE_DEV_DEBUG=line-tables-only
+      cargo-tests: |
+        [
+          {"name": "Unit", "packages": "core util", "profile": "ci", "doctests": "true",
+           "code-paths": "app/crates/core/**\napp/crates/util/**"},
+          {"name": "Integration", "packages": "server", "profile": "ci", "filter": "not group(slow)",
+           "with-postgres": "true", "pre-test-script": "./scripts/ci/db.sh",
+           "setup": "bash scripts/ci/redis-up.sh && export REDIS_URL=redis://127.0.0.1:6379"}
+        ]
+
 **Example with custom options:**
 ```yaml
 jobs:
@@ -442,6 +492,8 @@ This repo uses a **single major-rolling tag** convention. Consumers normally pin
 | Tag | Tip points at |
 |---|---|
 | `@v1` | the latest commit on `main` considered backwards-compatible with the original `@v1` API. Force-moved forward as additive sibling workflows and additive optional inputs land. |
+| `@v2` | `rust-pipeline.yml` with the matrix-driven `cargo-tests` sub-job (the `enable-database-tests` path removed). Each lane builds its own test binaries. |
+| `@v3` | `rust-pipeline.yml` / `cargo-tests.yml` with build once, run everywhere as the default for structured lanes (jcttech/trading#1160). Lane checks are `cargo-tests (<name>) / <name>`; new check `cargo-tests-archive`. |
 
 **Why a single rolling tag (rather than cutting `@v2` for every additive opt-in moment)?**
 

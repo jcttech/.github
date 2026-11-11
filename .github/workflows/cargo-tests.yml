@@ -50,6 +50,16 @@
 # `$GITHUB_STEP_SUMMARY` so it is never a silent green. PR behaviour is
 # otherwise unchanged.
 #
+# ## Running from a shared test archive (v3)
+#
+# Under `rust-pipeline.yml@v3` a lane can run from the run's nextest
+# archive instead of building: the pipeline passes `archive-artifact`,
+# `archive-command` (the lane's partition) and the build's paths, plus
+# its own gate verdict (`should-run`) and doc-test result. The lane then
+# downloads and extracts the archive and runs the partition; `command`
+# remains the fallback when the archive is gone. Called directly, with
+# none of those inputs, this workflow behaves exactly as v2.
+#
 # ## Backwards / forwards compat
 #
 # Adding fields to the matrix entry JSON is additive — missing keys
@@ -137,6 +147,63 @@ on:
         description: |
           PostgreSQL service hostname. Use `localhost` for ARC K8s and
           GHA runners; the service name for Docker-mode runners.
+      # ── Set by rust-pipeline.yml@v3 (build once, run everywhere) ──────
+      # A direct caller leaves these empty and gets v2's behaviour exactly.
+      should-run:
+        type: string
+        default: ''
+        description: |
+          'true' / 'false': the lane's gate, already decided by
+          rust-pipeline's `changes` job from this lane's `code-paths` (same
+          rules as below). Empty: this workflow evaluates `code-paths`
+          itself.
+      should-run-reason:
+        type: string
+        default: ''
+        description: 'Why, when `should-run` is set (shown in the log and the skip summary).'
+      archive-artifact:
+        type: string
+        default: ''
+        description: |
+          Name of the run's artifact holding the nextest archive this lane
+          runs from. Empty: the lane builds its own test binaries with
+          `command`, as in v2.
+      archive-file:
+        type: string
+        default: ''
+        description: 'File name of this lane''s archive inside `archive-artifact` (default `<archive-artifact>.tar.zst`).'
+      archive-status:
+        type: string
+        default: ''
+        description: |
+          The archive job's state: 'ready' once the archive is uploaded.
+          Anything else with `archive-artifact` set fails the lane (the
+          shared build failed; nothing to run).
+      archive-command:
+        type: string
+        default: ''
+        description: |
+          What the lane runs from the archive (its partition). Gets
+          `CARGO_TESTS_TARGET_DIR` / `CARGO_TESTS_WORKSPACE` in its env.
+      archive-target-dir:
+        type: string
+        default: ''
+        description: 'Absolute target directory of the build (the archive is extracted to the same path).'
+      archive-workspace-root:
+        type: string
+        default: ''
+        description: 'Absolute workspace root of the build (`--workspace-remap`).'
+      archive-github-workspace:
+        type: string
+        default: ''
+        description: "The build job's `$GITHUB_WORKSPACE`, to map its paths onto this job's."
+      doctests-verdict:
+        type: string
+        default: ''
+        description: |
+          This lane's doc-test result from the archive job ('passed' /
+          'failed'), when the lane asked for doc tests. Doc tests aren't in
+          a nextest archive, so they run once against the archive's build.
 
 jobs:
   run:
@@ -165,7 +232,7 @@ jobs:
 
       - name: Build paths-filter input
         id: build-filter
-        if: inputs.code-paths != '' && github.event_name == 'pull_request'
+        if: inputs.code-paths != '' && github.event_name == 'pull_request' && inputs.should-run == ''
         run: |
           PATHS=$(echo "${{ inputs.code-paths }}" | sed '/^$/d' | sed 's/^/      - /')
           {
@@ -177,7 +244,7 @@ jobs:
 
       - name: Compute should-run from code-paths
         id: changes
-        if: inputs.code-paths != '' && github.event_name == 'pull_request'
+        if: inputs.code-paths != '' && github.event_name == 'pull_request' && inputs.should-run == ''
         uses: dorny/paths-filter@v4
         with:
           filters: ${{ steps.build-filter.outputs.filters }}
@@ -190,6 +257,8 @@ jobs:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           CODE_PATHS: ${{ inputs.code-paths }}
           FILTER_RESULT: ${{ steps.changes.outputs.relevant }}
+          SHOULD_RUN: ${{ inputs.should-run }}
+          SHOULD_RUN_REASON: ${{ inputs.should-run-reason }}
         run: |
           # POSIX sh only -- these images may not carry bash (see PR #20).
           #
@@ -197,7 +266,15 @@ jobs:
           # optimisation. A push to the DEFAULT BRANCH is the canonical
           # ground-truth build, so it bypasses the path filter entirely and
           # always runs the real work -- jcttech/trading#200 option 2.
-          if [ "$EVENT_NAME" = "push" ] && [ -n "$DEFAULT_BRANCH" ] \
+          #
+          # Under rust-pipeline.yml@v3 the same rules were already applied
+          # to this lane's code-paths in its `changes` job (the archive is
+          # built for the lanes they triggered); that verdict is used as is.
+          if [ "$SHOULD_RUN" = "true" ] || [ "$SHOULD_RUN" = "false" ]; then
+            RUN="$SHOULD_RUN"
+            REASON="$SHOULD_RUN_REASON"
+            [ -n "$REASON" ] || REASON="decided by the changes job of rust-pipeline.yml"
+          elif [ "$EVENT_NAME" = "push" ] && [ -n "$DEFAULT_BRANCH" ] \
              && [ "$REF_NAME" = "$DEFAULT_BRANCH" ]; then
             RUN=true
             REASON="push to the default branch ($DEFAULT_BRANCH); D1 fast-lane bypassed"
@@ -258,6 +335,101 @@ jobs:
           echo "CARGO_NET_GIT_FETCH_WITH_CLI=true" >> "$GITHUB_ENV"
           echo "Configured private git auth via PRIVATE_REPO_TOKEN for cargo fetch"
 
+      # ── Build once, run everywhere (rust-pipeline.yml@v3) ─────────────
+      # With `archive-artifact` set, the lane downloads the run's test
+      # archive and runs its partition: it builds nothing. The archive is
+      # extracted before the database bootstrap, into the same absolute
+      # target directory the build used, so compile-time paths baked into
+      # the binaries (`env!("CARGO_BIN_EXE_…")`) still resolve. An archive
+      # that can't be downloaded (expired before a late re-run) or
+      # extracted falls back to the lane's own build, with a warning.
+      - name: Use the shared test archive
+        id: mode
+        if: steps.gate.outputs.should-run == 'true' && inputs.archive-artifact != ''
+        env:
+          NAME: ${{ inputs.name }}
+          ARCHIVE_STATUS: ${{ inputs.archive-status }}
+        run: |
+          if [ "$ARCHIVE_STATUS" != "ready" ]; then
+            echo "::error title=$NAME::the shared test build (the cargo-tests-archive job) did not produce the archive this lane runs from (state: ${ARCHIVE_STATUS:-unknown}). Its log has the cause; re-run it together with this lane."
+            exit 1
+          fi
+          echo "dir=$RUNNER_TEMP/cargo-tests-archive" >> "$GITHUB_OUTPUT"
+          echo "CARGO_TESTS_DOWNLOAD_T0=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Download the test archive
+        id: download
+        if: steps.mode.outcome == 'success'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.archive-artifact }}
+          path: ${{ steps.mode.outputs.dir }}
+
+      - name: Extract the test archive
+        id: extract
+        if: steps.download.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        env:
+          ARTIFACT: ${{ inputs.archive-artifact }}
+          ARCHIVE_FILE: ${{ inputs.archive-file }}
+          DIR: ${{ steps.mode.outputs.dir }}
+          BUILD_TARGET_DIR: ${{ inputs.archive-target-dir }}
+          BUILD_WORKSPACE_ROOT: ${{ inputs.archive-workspace-root }}
+          BUILD_GITHUB_WORKSPACE: ${{ inputs.archive-github-workspace }}
+        run: |
+          set -euo pipefail
+          file="$DIR/${ARCHIVE_FILE:-$ARTIFACT.tar.zst}"
+          down=$(( $(date +%s) - ${CARGO_TESTS_DOWNLOAD_T0:-$(date +%s)} ))
+          size=$(stat -c %s "$file")
+          echo "Downloaded $(( size / 1048576 )) MiB in ${down}s."
+          # The build's paths, mapped onto this job's checkout (the same
+          # path on every pod of one repository's runners).
+          ws="$BUILD_WORKSPACE_ROOT"; td="$BUILD_TARGET_DIR"
+          if [ -n "$BUILD_GITHUB_WORKSPACE" ] && [ "$BUILD_GITHUB_WORKSPACE" != "$GITHUB_WORKSPACE" ]; then
+            case "$ws" in "$BUILD_GITHUB_WORKSPACE"|"$BUILD_GITHUB_WORKSPACE"/*) ws="$GITHUB_WORKSPACE${ws#"$BUILD_GITHUB_WORKSPACE"}" ;; esac
+            case "$td" in "$BUILD_GITHUB_WORKSPACE"/*) td="$GITHUB_WORKSPACE${td#"$BUILD_GITHUB_WORKSPACE"}" ;; esac
+            echo "::warning::the build ran in $BUILD_GITHUB_WORKSPACE, this lane in $GITHUB_WORKSPACE: paths compiled into the test binaries point at the build's"
+          fi
+          if [ "$(basename "$td")" = "target" ]; then
+            to="$(dirname "$td")"
+          else
+            to="$RUNNER_TEMP/cargo-tests-extract"
+            mkdir -p "$to" "$(dirname "$td")"
+            ln -sfn "$to/target" "$td"
+          fi
+          start=$(date +%s)
+          cargo nextest list --archive-file "$file" --workspace-remap "$ws" \
+            --extract-to "$to" --extract-overwrite --list-type binaries-only > /dev/null
+          ext=$(( $(date +%s) - start ))
+          echo "Extracted $(du -sh "$to/target" | cut -f1) to $td in ${ext}s; this lane builds nothing."
+          echo "### Ran from the shared test archive: downloaded $(( size / 1048576 )) MiB in ${down}s, extracted in ${ext}s; nothing built" >> "$GITHUB_STEP_SUMMARY"
+          rm -f "$file"
+          {
+            echo "CARGO_TESTS_TARGET_DIR=$td"
+            echo "CARGO_TESTS_WORKSPACE=$ws"
+          } >> "$GITHUB_ENV"
+          echo "mode=archive" >> "$GITHUB_OUTPUT"
+
+      - name: Fall back to building this lane
+        if: steps.mode.outcome == 'success' && steps.extract.outputs.mode != 'archive'
+        env:
+          NAME: ${{ inputs.name }}
+          ARTIFACT: ${{ inputs.archive-artifact }}
+        run: |
+          echo "::warning title=$NAME::the test archive $ARTIFACT could not be downloaded or extracted (an artifact expires after cargo-tests-archive-retention-days), so this lane builds its own test binaries"
+
+      - name: Check there is a command to run
+        if: >-
+          steps.gate.outputs.should-run == 'true' &&
+          steps.extract.outputs.mode != 'archive' && inputs.command == ''
+        env:
+          NAME: ${{ inputs.name }}
+        run: |
+          echo "::error title=$NAME::this lane has no command to build and run its tests (set 'command', or 'packages' under rust-pipeline.yml@v3)"
+          exit 1
+
       - name: Install PostgreSQL client
         if: >-
           steps.gate.outputs.should-run == 'true' &&
@@ -305,14 +477,32 @@ jobs:
           DATABASE_URL: postgres://test:test@${{ env.PG_HOST }}:5432/test_db
         run: bash "${{ inputs.pre-test-script }}"
 
+      # From the archive: `archive-command` (the lane's partition, nothing
+      # built). Otherwise: `command`, exactly as v2 ran it.
       - name: Run cargo tests (with DATABASE_URL)
         if: steps.gate.outputs.should-run == 'true' && inputs.with-postgres == 'true'
         working-directory: ${{ inputs.working-directory }}
         env:
           DATABASE_URL: postgres://test:test@${{ env.PG_HOST }}:5432/test_db
-        run: ${{ inputs.command }}
+        run: ${{ (steps.extract.outputs.mode == 'archive' && inputs.archive-command) || inputs.command }}
 
       - name: Run cargo tests
         if: steps.gate.outputs.should-run == 'true' && inputs.with-postgres != 'true'
         working-directory: ${{ inputs.working-directory }}
-        run: ${{ inputs.command }}
+        run: ${{ (steps.extract.outputs.mode == 'archive' && inputs.archive-command) || inputs.command }}
+
+      # Doc tests aren't in a nextest archive: the archive job ran them once
+      # against its build. A lane that asked for them fails here on its own.
+      - name: Doc tests (run by the cargo-tests-archive job)
+        if: >-
+          !cancelled() && steps.gate.outputs.should-run == 'true' &&
+          steps.extract.outputs.mode == 'archive' && inputs.doctests-verdict != ''
+        env:
+          NAME: ${{ inputs.name }}
+          VERDICT: ${{ inputs.doctests-verdict }}
+        run: |
+          case "$VERDICT" in
+            passed) echo "This lane's doc tests passed in the cargo-tests-archive job." ;;
+            failed) echo "::error title=$NAME::this lane's doc tests failed in the cargo-tests-archive job (its log and summary name the crate)"; exit 1 ;;
+            *) echo "::error title=$NAME::the cargo-tests-archive job left no doc-test result for this lane ($VERDICT)"; exit 1 ;;
+          esac
