@@ -168,6 +168,10 @@ on:
           Name of the run's artifact holding the nextest archive this lane
           runs from. Empty: the lane builds its own test binaries with
           `command`, as in v2.
+      archive-file:
+        type: string
+        default: ''
+        description: 'File name of this lane''s archive inside `archive-artifact` (default `<archive-artifact>.tar.zst`).'
       archive-status:
         type: string
         default: ''
@@ -368,13 +372,14 @@ jobs:
         shell: bash
         env:
           ARTIFACT: ${{ inputs.archive-artifact }}
+          ARCHIVE_FILE: ${{ inputs.archive-file }}
           DIR: ${{ steps.mode.outputs.dir }}
           BUILD_TARGET_DIR: ${{ inputs.archive-target-dir }}
           BUILD_WORKSPACE_ROOT: ${{ inputs.archive-workspace-root }}
           BUILD_GITHUB_WORKSPACE: ${{ inputs.archive-github-workspace }}
         run: |
           set -euo pipefail
-          file="$DIR/$ARTIFACT.tar.zst"
+          file="$DIR/${ARCHIVE_FILE:-$ARTIFACT.tar.zst}"
           ls -l "$file"
           # The build's paths, mapped onto this job's checkout (the same
           # path on every pod of one repository's runners).

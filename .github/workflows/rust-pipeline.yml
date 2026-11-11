@@ -774,6 +774,7 @@ jobs:
     outputs:
       status: ${{ steps.ready.outputs.status || steps.features.outputs.status }}
       excluded: ${{ steps.features.outputs.excluded }}
+      lane-archives: ${{ steps.archive.outputs.lane-archives }}
       target-dir: ${{ steps.archive.outputs.target-dir }}
       workspace-root: ${{ steps.archive.outputs.workspace-root }}
       github-workspace: ${{ steps.archive.outputs.github-workspace }}
@@ -921,7 +922,14 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Build the test archive
+      # One build (the union's -p/--features selection, so every lane's
+      # crates are compiled exactly once and agree on features), then one
+      # archive per lane holding only its packages' binaries, so a lane
+      # downloads and extracts its own partition, not everyone's (trading
+      # run 43058297492: one 9.2 GB archive pulled by five lanes). The
+      # first `cargo nextest archive` builds everything; the rest only
+      # re-archive (cargo has nothing left to do).
+      - name: Build the test archives
         id: archive
         if: steps.features.outputs.build == 'true'
         shell: bash
@@ -929,47 +937,188 @@ jobs:
           ARTIFACT: ${{ fromJson(needs.changes.outputs.cargo-tests-archive).artifact }}
           PKGS: ${{ steps.features.outputs.packages }}
           FEATS: ${{ steps.features.outputs.features }}
-          LANES: ${{ steps.features.outputs.lanes }}
+          ARCHIVE_LANES: ${{ steps.features.outputs.lanes }}
           CT_BUILD_WRAPPER: ${{ inputs.cargo-tests-build-wrapper }}
         run: |
           set -euo pipefail -f
+          slots=12   # upload steps below; lanes beyond that share a slot's artifact
           manifest="$GITHUB_WORKSPACE/$CT_MANIFEST"
-          dir="$RUNNER_TEMP/cargo-tests-archive"; mkdir -p "$dir"
-          file="$dir/$ARTIFACT.tar.zst"
+          dir="$RUNNER_TEMP/cargo-tests-archive"; rm -rf "$dir"; mkdir -p "$dir"
           a=(); for p in $PKGS; do a+=(-p "$p"); done
           [ -n "$FEATS" ] && a+=(--features "$FEATS")
-          set -- cargo nextest archive --manifest-path "$manifest" "${a[@]}" --archive-file "$file"
-          echo "Building: ${CT_BUILD_WRAPPER:+$CT_BUILD_WRAPPER }$* (CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-unset})"
+          mapfile -t lanes < <(jq -r '.[]' <<<"$ARCHIVE_LANES")
+          lanepk() { jq -r --arg n "$1" '.["lane-packages"][$n]' <<<"$ARCHIVE_PLAN"; }
+          archives='{}'; rows=""; total=0; build_secs=0
           start=$(date +%s)
-          if [ -n "$CT_BUILD_WRAPPER" ]; then eval "$CT_BUILD_WRAPPER \"\$@\""; else "$@"; fi
+          for k in "${!lanes[@]}"; do
+            n="${lanes[$k]}"; slot=$(( k % slots )); mkdir -p "$dir/slot-$slot"
+            file="lane-$k.tar.zst"
+            expr=""; for p in $(lanepk "$n"); do expr+="${expr:+ | }package(=$p)"; done
+            set -- cargo nextest archive --manifest-path "$manifest" "${a[@]}" -E "$expr" --archive-file "$dir/slot-$slot/$file"
+            t0=$(date +%s)
+            if [ "$k" -eq 0 ]; then
+              echo "Building once for ${#lanes[@]} lanes: ${CT_BUILD_WRAPPER:+$CT_BUILD_WRAPPER }$* (CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-unset})"
+              if [ -n "$CT_BUILD_WRAPPER" ]; then eval "$CT_BUILD_WRAPPER \"\$@\""; else "$@"; fi
+              build_secs=$(( $(date +%s) - t0 ))
+            else
+              echo "Archiving lane $n: $*"
+              "$@"
+            fi
+            size=$(stat -c %s "$dir/slot-$slot/$file"); total=$(( total + size ))
+            echo "slot-$slot=true" >> "$GITHUB_OUTPUT"
+            archives=$(jq -c --arg n "$n" --arg a "$ARTIFACT-$slot" --arg f "$file" '. + {($n): {artifact: $a, file: $f}}' <<<"$archives")
+            rows+="| $n | \`$expr\` | $(awk -v b="$size" 'BEGIN { printf "%.0f MiB", b / 1048576 }') | $(( $(date +%s) - t0 ))s |"$'\n'
+          done
           secs=$(( $(date +%s) - start ))
           meta=$(cargo metadata --no-deps --format-version 1 --manifest-path "$manifest")
           {
-            echo "file=$file"
+            echo "dir=$dir"
+            echo "lane-archives=$archives"
             echo "target-dir=$(jq -r .target_directory <<<"$meta")"
             echo "workspace-root=$(jq -r .workspace_root <<<"$meta")"
             echo "github-workspace=$GITHUB_WORKSPACE"
           } >> "$GITHUB_OUTPUT"
-          size=$(stat -c %s "$file")
+          mib() { awk -v b="$1" 'BEGIN { printf "%.0f MiB", b / 1048576 }'; }
           {
             echo "## cargo-tests archive"
             echo
-            echo "| Lanes | Packages | Features | CARGO_BUILD_JOBS | Build + archive | Archive size |"
-            echo "|---|---|---|---|---|---|"
-            echo "| $(jq -r 'join(", ")' <<<"$LANES") | \`$PKGS\` | \`${FEATS:-none}\` | ${CARGO_BUILD_JOBS:-unset} | $((secs / 60))m$((secs % 60))s | $(awk -v b="$size" 'BEGIN { printf "%.0f MiB", b / 1048576 }') |"
+            echo "Built once: \`$PKGS\`${FEATS:+, features \`$FEATS\`}; CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-unset}; build $((build_secs / 60))m$((build_secs % 60))s, build + archives $((secs / 60))m$((secs % 60))s, $(mib "$total") in all."
+            echo
+            echo "| Lane | Archived binaries | Archive | Time |"
+            echo "|---|---|---|---|"
+            printf '%s' "$rows"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload the test archive
-        if: steps.archive.outcome == 'success'
+      - name: Upload the test archive (slot 0)
+        if: steps.archive.outputs.slot-0 == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ fromJson(needs.changes.outputs.cargo-tests-archive).artifact }}
-          path: ${{ steps.archive.outputs.file }}
+          name: ${{ fromJson(needs.changes.outputs.cargo-tests-archive).artifact }}-0
+          path: ${{ steps.archive.outputs.dir }}/slot-0
           retention-days: ${{ inputs.cargo-tests-archive-retention-days }}
-          # Already zstd-compressed.
-          compression-level: 0
-          # A re-run of this job replaces the archive of the earlier attempt.
-          overwrite: true
+          compression-level: 0   # already zstd
+          overwrite: true        # a re-run of this job replaces the earlier attempt's
+          if-no-files-found: error
+
+      - name: Upload the test archive (slot 1)
+        if: steps.archive.outputs.slot-1 == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ fromJson(needs.changes.outputs.cargo-tests-archive).artifact }}-1
+          path: ${{ steps.archive.outputs.dir }}/slot-1
+          retention-days: ${{ inputs.cargo-tests-archive-retention-days }}
+          compression-level: 0   # already zstd
+          overwrite: true        # a re-run of this job replaces the earlier attempt's
+          if-no-files-found: error
+
+      - name: Upload the test archive (slot 2)
+        if: steps.archive.outputs.slot-2 == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ fromJson(needs.changes.outputs.cargo-tests-archive).artifact }}-2
+          path: ${{ steps.archive.outputs.dir }}/slot-2
+          retention-days: ${{ inputs.cargo-tests-archive-retention-days }}
+          compression-level: 0   # already zstd
+          overwrite: true        # a re-run of this job replaces the earlier attempt's
+          if-no-files-found: error
+
+      - name: Upload the test archive (slot 3)
+        if: steps.archive.outputs.slot-3 == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ fromJson(needs.changes.outputs.cargo-tests-archive).artifact }}-3
+          path: ${{ steps.archive.outputs.dir }}/slot-3
+          retention-days: ${{ inputs.cargo-tests-archive-retention-days }}
+          compression-level: 0   # already zstd
+          overwrite: true        # a re-run of this job replaces the earlier attempt's
+          if-no-files-found: error
+
+      - name: Upload the test archive (slot 4)
+        if: steps.archive.outputs.slot-4 == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ fromJson(needs.changes.outputs.cargo-tests-archive).artifact }}-4
+          path: ${{ steps.archive.outputs.dir }}/slot-4
+          retention-days: ${{ inputs.cargo-tests-archive-retention-days }}
+          compression-level: 0   # already zstd
+          overwrite: true        # a re-run of this job replaces the earlier attempt's
+          if-no-files-found: error
+
+      - name: Upload the test archive (slot 5)
+        if: steps.archive.outputs.slot-5 == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ fromJson(needs.changes.outputs.cargo-tests-archive).artifact }}-5
+          path: ${{ steps.archive.outputs.dir }}/slot-5
+          retention-days: ${{ inputs.cargo-tests-archive-retention-days }}
+          compression-level: 0   # already zstd
+          overwrite: true        # a re-run of this job replaces the earlier attempt's
+          if-no-files-found: error
+
+      - name: Upload the test archive (slot 6)
+        if: steps.archive.outputs.slot-6 == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ fromJson(needs.changes.outputs.cargo-tests-archive).artifact }}-6
+          path: ${{ steps.archive.outputs.dir }}/slot-6
+          retention-days: ${{ inputs.cargo-tests-archive-retention-days }}
+          compression-level: 0   # already zstd
+          overwrite: true        # a re-run of this job replaces the earlier attempt's
+          if-no-files-found: error
+
+      - name: Upload the test archive (slot 7)
+        if: steps.archive.outputs.slot-7 == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ fromJson(needs.changes.outputs.cargo-tests-archive).artifact }}-7
+          path: ${{ steps.archive.outputs.dir }}/slot-7
+          retention-days: ${{ inputs.cargo-tests-archive-retention-days }}
+          compression-level: 0   # already zstd
+          overwrite: true        # a re-run of this job replaces the earlier attempt's
+          if-no-files-found: error
+
+      - name: Upload the test archive (slot 8)
+        if: steps.archive.outputs.slot-8 == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ fromJson(needs.changes.outputs.cargo-tests-archive).artifact }}-8
+          path: ${{ steps.archive.outputs.dir }}/slot-8
+          retention-days: ${{ inputs.cargo-tests-archive-retention-days }}
+          compression-level: 0   # already zstd
+          overwrite: true        # a re-run of this job replaces the earlier attempt's
+          if-no-files-found: error
+
+      - name: Upload the test archive (slot 9)
+        if: steps.archive.outputs.slot-9 == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ fromJson(needs.changes.outputs.cargo-tests-archive).artifact }}-9
+          path: ${{ steps.archive.outputs.dir }}/slot-9
+          retention-days: ${{ inputs.cargo-tests-archive-retention-days }}
+          compression-level: 0   # already zstd
+          overwrite: true        # a re-run of this job replaces the earlier attempt's
+          if-no-files-found: error
+
+      - name: Upload the test archive (slot 10)
+        if: steps.archive.outputs.slot-10 == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ fromJson(needs.changes.outputs.cargo-tests-archive).artifact }}-10
+          path: ${{ steps.archive.outputs.dir }}/slot-10
+          retention-days: ${{ inputs.cargo-tests-archive-retention-days }}
+          compression-level: 0   # already zstd
+          overwrite: true        # a re-run of this job replaces the earlier attempt's
+          if-no-files-found: error
+
+      - name: Upload the test archive (slot 11)
+        if: steps.archive.outputs.slot-11 == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ fromJson(needs.changes.outputs.cargo-tests-archive).artifact }}-11
+          path: ${{ steps.archive.outputs.dir }}/slot-11
+          retention-days: ${{ inputs.cargo-tests-archive-retention-days }}
+          compression-level: 0   # already zstd
+          overwrite: true        # a re-run of this job replaces the earlier attempt's
           if-no-files-found: error
 
       - name: Archive ready
@@ -1110,11 +1259,15 @@ jobs:
       rust-version: ${{ inputs.rust-version }}
       should-run: ${{ matrix.entry.run || '' }}
       should-run-reason: ${{ matrix.entry.run-reason || '' }}
-      # Archive lanes not moved off the archive by the feature check.
+      # Archive lanes not moved off the archive by the feature check: their
+      # own artifact (one per lane). If the archive job failed there is none,
+      # and `archive-status` fails the lane.
       archive-artifact: >-
         ${{ (matrix.entry.mode == 'archive' &&
              !contains(fromJson(needs.cargo-tests-archive.outputs.excluded || '[]'), matrix.entry.name) &&
-             fromJson(needs.changes.outputs.cargo-tests-archive).artifact) || '' }}
+             (fromJson(needs.cargo-tests-archive.outputs.lane-archives || '{}')[matrix.entry.name].artifact ||
+              format('{0}-missing', fromJson(needs.changes.outputs.cargo-tests-archive).artifact))) || '' }}
+      archive-file: ${{ fromJson(needs.cargo-tests-archive.outputs.lane-archives || '{}')[matrix.entry.name].file || '' }}
       archive-status: ${{ needs.cargo-tests-archive.outputs.status || needs.cargo-tests-archive.result }}
       archive-command: ${{ matrix.entry.archive-command || '' }}
       archive-target-dir: ${{ needs.cargo-tests-archive.outputs.target-dir }}
