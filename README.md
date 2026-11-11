@@ -124,12 +124,27 @@ Complete CI/CD for Rust projects: change detection, build, clippy, test, Docker,
 | `cargo-tests-feature-check` | string | `report` | `report` / `strict` / `off` — Cargo unifies features across one build's packages; `report` lists the workspace crates whose features differ from a lane-alone build, `strict` builds such lanes on their own |
 | `cargo-tests-archive-warn-mib` | number | `2048` | Warn when one run's test archives exceed this many MiB (they're uploaded before any lane starts) |
 | `cargo-tests-archive-retention-days` | number | `1` | Retention of the archive artifacts; a lane re-run after expiry builds itself |
+| `cargo-tests-archive-cleanup` | boolean | `true` | Delete the run's archives once every lane passed (`cargo-tests-archive-cleanup` job); keep them for "Re-run failed jobs" when a lane failed or the run was cancelled. Needs `actions: write` granted by the **caller** (see below); without it the job leaves a notice and passes |
 
 Lane fields: `name` (required), `command`, `with-postgres`, `postgres-image`, `pre-test-script`, `init-sql`, `code-paths`, `working-directory` (as in v2), and the structured fields `packages` (the `-p` list; makes the lane eligible for the archive), `features`, `profile`, `filter` (nextest filterset, ANDed with the packages), `nextest-args`, `doctests` (`'true'`/`'false'`), `setup` (shell before the tests, same step), `test-wrapper`, `build-once` (`'false'` = always build itself), `build-jobs`.
 
 How a run goes: the `changes` job evaluates every lane's `code-paths` (pull requests only, fail-open) and plans each triggered lane as *archive* or *per-lane*. A lane builds itself when the pipeline opts out (`cargo-tests-build-once: false`), the lane opts out, it has no `packages` (a free-form `command` can't be shared), the image lacks `cargo-nextest`, fewer than two triggered lanes qualify, or `cargo-tests-feature-check: strict` moves it off. With two or more archive lanes, `cargo-tests-archive` builds the union of **their** packages and features once, writes one archive per lane (only that lane's packages' binaries), uploads each as an artifact, and runs `cargo test --doc` once against the same build (nextest archives carry no doc tests); each lane downloads its own archive, runs `cargo nextest run -E '(package(=…) | …) & (<filter>)'` from it, and fails on its own packages' doc-test result. A re-run of a failed lane reuses the archive. If the archive job fails, every archive lane fails with a pointer to it.
 
-Archive size is what decides whether this pays: every test binary statically links the whole dependency graph, the archives are uploaded before any lane starts, and the job summaries report sizes and transfer times every run. Fewer, larger test binaries (one integration-test binary per area) keep the archives small; `CARGO_PROFILE_TEST_STRIP=debuginfo` in `cargo-tests-build-env` cuts about a quarter at the cost of line numbers in backtraces (the panic's own `file:line` is kept). A nextest archive carries the tested packages' build-script outputs but not a dependency's: a test that reads a dependency's `OUT_DIR` at run time (rust-embed in debug builds, e.g. utoipa-swagger-ui's Swagger UI) needs the dependency to embed it (`debug-embed`) or nextest's `[profile.default.archive] include`. The archive build runs at `CARGO_BUILD_JOBS=1` unless raised: it links one binary at a time, so its memory peak is one heavy link (4.5 GiB of anonymous memory on jcttech/trading's largest workspace).
+Archive size is what decides whether this pays: every test binary statically links the whole dependency graph, the archives are uploaded before any lane starts, and the job summaries report sizes and transfer times every run. Fewer, larger test binaries (one integration-test binary per area) keep the archives small; `CARGO_PROFILE_TEST_STRIP=debuginfo` in `cargo-tests-build-env` cuts about a quarter at the cost of line numbers in backtraces (the panic's own `file:line` is kept). **Archive storage and cleanup.** The archives are Actions artifacts and count against the organisation's Actions storage. jcttech/trading's five lanes come to about 2.5 GB per run. With `cargo-tests-archive-cleanup` (the default) and `actions: write` granted, a green run deletes them as its last job, after about 20 minutes of storage. A failed or cancelled run keeps them for re-runs until `cargo-tests-archive-retention-days` (1 day) removes them. Without the grant every run keeps them for the day: about 2.5 GB-days per run. A called workflow can't raise its caller's token permissions, so the grant goes on the caller's job:
+
+```yaml
+jobs:
+  ci:
+    uses: jcttech/.github/.github/workflows/rust-pipeline.yml@v3
+    permissions:
+      contents: read
+      actions: write   # lets cargo-tests-archive-cleanup delete the run's test archives
+    secrets: inherit
+```
+
+(If the workflow sets `permissions:` at the top, add `actions: write` there or on the calling job; nested jobs only ever get what the caller's job has.)
+
+A nextest archive carries the tested packages' build-script outputs but not a dependency's: a test that reads a dependency's `OUT_DIR` at run time (rust-embed in debug builds, e.g. utoipa-swagger-ui's Swagger UI) needs the dependency to embed it (`debug-embed`) or nextest's `[profile.default.archive] include`. The archive build runs at `CARGO_BUILD_JOBS=1` unless raised: it links one binary at a time, so its memory peak is one heavy link (4.5 GiB of anonymous memory on jcttech/trading's largest workspace).
 
 ```yaml
       enable-cargo-tests: true

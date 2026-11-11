@@ -220,8 +220,21 @@ on:
         type: number
         default: 1
         description: |
-          Retention of the test-archive artifact. A lane re-run after it
+          Retention of the test-archive artifacts. A lane re-run after they
           expired builds its own test binaries (with a warning).
+      cargo-tests-archive-cleanup:
+        type: boolean
+        default: true
+        description: |
+          Delete the run's test archives once every cargo-tests lane has
+          succeeded (`cargo-tests-archive-cleanup` job); keep them when a
+          lane failed or the run was cancelled, so "Re-run failed jobs"
+          still finds them (retention removes them later). Deleting needs
+          `actions: write` on the token the CALLER grants: a called
+          workflow can't raise its caller's permissions, and a job here that
+          asked for it would stop every caller that doesn't grant it from
+          starting. Without it the job says so in a notice and passes; the
+          archives then expire after `cargo-tests-archive-retention-days`.
       enable-openapi-drift:
         type: boolean
         default: false
@@ -1307,6 +1320,67 @@ jobs:
       doctests-verdict: >-
         ${{ (matrix.entry.mode == 'archive' && matrix.entry.doctests == 'true' &&
              (fromJson(needs.cargo-tests-archive.outputs.doctests || '{}')[matrix.entry.name] || 'missing')) || '' }}
+
+
+  # ── cargo-tests: delete the run's archives once they've served (v3) ──
+  # Every lane passed: nothing will re-run, so the archives only cost
+  # Actions storage until retention removes them. Any lane failed or the
+  # run was cancelled: keep them for "Re-run failed jobs" (which re-runs
+  # this job after the lanes, so a green re-run deletes them then). The
+  # job never fails the run. No `permissions:` on purpose: a nested job
+  # can't be granted more than its caller's token, and asking for
+  # `actions: write` here would make every caller that doesn't grant it
+  # fail at startup, so it uses the caller's token as it comes and stops
+  # with a notice when that can't delete.
+  cargo-tests-archive-cleanup:
+    name: cargo-tests-archive-cleanup
+    needs: [changes, cargo-tests-archive, cargo-tests]
+    if: >-
+      !cancelled() && inputs.cargo-tests-archive-cleanup &&
+      needs.cargo-tests-archive.result == 'success' &&
+      needs.cargo-tests.result == 'success'
+    runs-on: ${{ inputs.runner }}
+    container: ${{ inputs.container-image || null }}
+    steps:
+      - name: Delete this run's test archives
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREFIX: ${{ fromJson(needs.changes.outputs.cargo-tests-archive).artifact }}-
+        run: |
+          set -uo pipefail
+          api="${GITHUB_API_URL:-https://api.github.com}/repos/$GITHUB_REPOSITORY/actions"
+          auth=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28")
+          note() {
+            echo "::notice title=cargo-tests archive cleanup::$1"
+            { echo "## cargo-tests archive cleanup"; echo; echo "$1"; } >> "$GITHUB_STEP_SUMMARY"
+          }
+          if ! list=$(curl -fsS "${auth[@]}" "$api/runs/$GITHUB_RUN_ID/artifacts?per_page=100"); then
+            note "Could not list this run's artifacts; the test archives stay until retention removes them."
+            exit 0
+          fi
+          mapfile -t rows < <(jq -r --arg p "$PREFIX" '.artifacts[] | select(.name | startswith($p)) | "\(.id) \(.size_in_bytes) \(.name)"' <<<"$list")
+          if [ "${#rows[@]}" -eq 0 ]; then
+            note "No test archives of this run left to delete."
+            exit 0
+          fi
+          deleted=0; bytes=0; denied=false
+          for r in "${rows[@]}"; do
+            read -r id size name <<<"$r"
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE "${auth[@]}" "$api/artifacts/$id" || echo 000)
+            case "$code" in
+              204) deleted=$((deleted + 1)); bytes=$((bytes + size)); echo "Deleted $name ($((size / 1048576)) MiB)." ;;
+              404) echo "$name is already gone." ;;
+              401|403) denied=true; break ;;
+              *) echo "::warning title=cargo-tests archive cleanup::deleting $name returned HTTP $code; it stays until retention removes it" ;;
+            esac
+          done
+          if [ "$denied" = true ]; then
+            note "The workflow token can't delete artifacts: grant \`actions: write\` to the job that calls rust-pipeline.yml to have the test archives deleted when every lane passes (or set cargo-tests-archive-cleanup: false to skip this job). They stay until cargo-tests-archive-retention-days removes them."
+          else
+            note "Every lane passed: deleted $deleted test archive(s), $((bytes / 1048576)) MiB."
+          fi
+          exit 0
 
   openapi-drift:
     needs: changes
