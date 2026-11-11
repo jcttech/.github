@@ -124,6 +124,7 @@ Complete CI/CD for Rust projects: change detection, build, clippy, test, Docker,
 | `cargo-tests-feature-check` | string | `report` | `report` / `strict` / `off` — Cargo unifies features across one build's packages; `report` lists the workspace crates whose features differ from a lane-alone build, `strict` builds such lanes on their own |
 | `cargo-tests-archive-warn-mib` | number | `2048` | Warn when one run's test archives exceed this many MiB (they're uploaded before any lane starts) |
 | `cargo-tests-archive-retention-days` | number | `1` | Retention of the archive artifacts; a lane re-run after expiry builds itself |
+| `cargo-tests-archive-dir` | string | `''` | A directory on a shared cache volume (K8s NFS, like `rust-setup`'s `shared-cache`), e.g. `/cache/cargo-tests-archive`: the archives go there instead of GitHub artifacts (see below). Empty: artifacts |
 | `cargo-tests-archive-cleanup` | boolean | `true` | Delete the run's archives once every lane passed (`cargo-tests-archive-cleanup` job); keep them for "Re-run failed jobs" when a lane failed or the run was cancelled. Needs `actions: write` granted by the **caller** (see below); without it the job leaves a notice and passes |
 
 Lane fields: `name` (required), `command`, `with-postgres`, `postgres-image`, `pre-test-script`, `init-sql`, `code-paths`, `working-directory` (as in v2), and the structured fields `packages` (the `-p` list; makes the lane eligible for the archive), `features`, `profile`, `filter` (nextest filterset, ANDed with the packages), `nextest-args`, `doctests` (`'true'`/`'false'`), `setup` (shell before the tests, same step), `test-wrapper`, `build-once` (`'false'` = always build itself), `build-jobs`.
@@ -143,6 +144,17 @@ jobs:
 ```
 
 (If the workflow sets `permissions:` at the top, add `actions: write` there or on the calling job; nested jobs only ever get what the caller's job has.)
+
+**Shared archive directory (`cargo-tests-archive-dir`).** On self-hosted runners whose job containers mount a shared volume, as jcttech's ARC runners mount `/cache` for sccache, set `cargo-tests-archive-dir: /cache/cargo-tests-archive`. It has these effects:
+- The archive job writes each lane's archive to `<dir>/<owner>/<repo>/<run_id>/cargo-tests-archive-<hash>/lane-<n>.tar.zst`. It writes to a temporary name, puts the SHA-256 beside the file, then renames it, so a lane never sees a partial file.
+- Each lane verifies the checksum and reads its archive in place. There is no artifact upload or download, nothing counts against Actions storage, and no `actions: write` is needed.
+- The directory is keyed on the run id, not the attempt, so "Re-run failed jobs" finds the files.
+- Cleanup (`cargo-tests-archive-cleanup`) deletes the pipeline's run directory when every lane passed.
+- Each archive job sweeps run directories older than `cargo-tests-archive-retention-days` under `<dir>/<owner>/<repo>`.
+- Every delete is guarded: it refuses an empty path, `/`, `.` or `..` segments, symlinks, `SCCACHE_DIR` or anything inside it, and anything that isn't a run directory under `<dir>/<owner>/<repo>`.
+- If the directory isn't on a mounted volume or isn't writable in the archive job, the run uses artifacts with a notice. A lane that can't find or verify its archive builds its own test binaries, with a warning.
+- The job summaries report sizes, write and read times, and the volume's free space, and warn below four times the run's archive size.
+- **Trust model:** any job on those runners can read and write the volume, as with sccache. A job could replace an archive, but the checksum only catches corruption, not a hostile job on the same runners. Use it only where the runners are yours and run only your repositories' jobs.
 
 A nextest archive carries the tested packages' build-script outputs but not a dependency's: a test that reads a dependency's `OUT_DIR` at run time (rust-embed in debug builds, e.g. utoipa-swagger-ui's Swagger UI) needs the dependency to embed it (`debug-embed`) or nextest's `[profile.default.archive] include`. The archive build runs at `CARGO_BUILD_JOBS=1` unless raised: it links one binary at a time, so its memory peak is one heavy link (4.5 GiB of anonymous memory on jcttech/trading's largest workspace).
 

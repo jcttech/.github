@@ -172,6 +172,14 @@ on:
         type: string
         default: ''
         description: 'File name of this lane''s archive inside `archive-artifact` (default `<archive-artifact>.tar.zst`).'
+      archive-path:
+        type: string
+        default: ''
+        description: |
+          Absolute path of this lane's archive on a shared volume
+          (rust-pipeline's `cargo-tests-archive-dir`), its SHA-256 at
+          `<path>.sha256`. When set, the lane verifies and reads it in place
+          instead of downloading `archive-artifact`.
       archive-status:
         type: string
         default: ''
@@ -357,9 +365,38 @@ jobs:
           echo "dir=$RUNNER_TEMP/cargo-tests-archive" >> "$GITHUB_OUTPUT"
           echo "CARGO_TESTS_DOWNLOAD_T0=$(date +%s)" >> "$GITHUB_ENV"
 
+      # The shared volume: verify the checksum and read the archive in
+      # place (one sequential read for the checksum, which leaves the file
+      # in the page cache for the extraction's read). Missing or
+      # mismatched: the lane falls back to its own build, as for an
+      # expired artifact.
+      - name: Read the test archive from the shared volume
+        id: shared
+        if: steps.mode.outcome == 'success' && inputs.archive-path != ''
+        continue-on-error: true
+        shell: bash
+        env:
+          NAME: ${{ inputs.name }}
+          ARCHIVE_PATH: ${{ inputs.archive-path }}
+        run: |
+          set -uo pipefail
+          t0=$(date +%s)
+          if [ ! -f "$ARCHIVE_PATH" ]; then
+            echo "::warning title=$NAME::$ARCHIVE_PATH isn't on this job's shared volume (mounted here? the same volume as the archive job's?)"
+            exit 1
+          fi
+          want=$(awk 'NR == 1 { print $1 }' "$ARCHIVE_PATH.sha256" 2>/dev/null)
+          got=$(sha256sum "$ARCHIVE_PATH" | awk '{ print $1 }')
+          if [ -z "$want" ] || [ "$want" != "$got" ]; then
+            echo "::warning title=$NAME::$ARCHIVE_PATH failed its SHA-256 check (expected ${want:-none}, got $got)"
+            exit 1
+          fi
+          echo "Verified $ARCHIVE_PATH ($(( $(stat -c %s "$ARCHIVE_PATH") / 1048576 )) MiB, SHA-256 $got) in $(( $(date +%s) - t0 ))s."
+          echo "file=$ARCHIVE_PATH" >> "$GITHUB_OUTPUT"
+
       - name: Download the test archive
         id: download
-        if: steps.mode.outcome == 'success'
+        if: steps.mode.outcome == 'success' && inputs.archive-path == ''
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
@@ -368,22 +405,24 @@ jobs:
 
       - name: Extract the test archive
         id: extract
-        if: steps.download.outcome == 'success'
+        if: steps.download.outcome == 'success' || steps.shared.outcome == 'success'
         continue-on-error: true
         shell: bash
         env:
           ARTIFACT: ${{ inputs.archive-artifact }}
           ARCHIVE_FILE: ${{ inputs.archive-file }}
+          SHARED_FILE: ${{ steps.shared.outputs.file }}
           DIR: ${{ steps.mode.outputs.dir }}
           BUILD_TARGET_DIR: ${{ inputs.archive-target-dir }}
           BUILD_WORKSPACE_ROOT: ${{ inputs.archive-workspace-root }}
           BUILD_GITHUB_WORKSPACE: ${{ inputs.archive-github-workspace }}
         run: |
           set -euo pipefail
-          file="$DIR/${ARCHIVE_FILE:-$ARTIFACT.tar.zst}"
+          file="${SHARED_FILE:-$DIR/${ARCHIVE_FILE:-$ARTIFACT.tar.zst}}"
           down=$(( $(date +%s) - ${CARGO_TESTS_DOWNLOAD_T0:-$(date +%s)} ))
           size=$(stat -c %s "$file")
-          echo "Downloaded $(( size / 1048576 )) MiB in ${down}s."
+          if [ -n "$SHARED_FILE" ]; then how="read in place from the shared volume ($SHARED_FILE, checksum verified)"; else how="downloaded"; fi
+          echo "Archive $(( size / 1048576 )) MiB, $how, ${down}s."
           # The build's paths, mapped onto this job's checkout (the same
           # path on every pod of one repository's runners).
           ws="$BUILD_WORKSPACE_ROOT"; td="$BUILD_TARGET_DIR"
@@ -404,8 +443,8 @@ jobs:
             --extract-to "$to" --extract-overwrite --list-type binaries-only > /dev/null
           ext=$(( $(date +%s) - start ))
           echo "Extracted $(du -sh "$to/target" | cut -f1) to $td in ${ext}s; this lane builds nothing."
-          echo "### Ran from the shared test archive: downloaded $(( size / 1048576 )) MiB in ${down}s, extracted in ${ext}s; nothing built" >> "$GITHUB_STEP_SUMMARY"
-          rm -f "$file"
+          echo "### Ran from the shared test archive: $(( size / 1048576 )) MiB $how in ${down}s, extracted in ${ext}s; nothing built" >> "$GITHUB_STEP_SUMMARY"
+          [ -n "$SHARED_FILE" ] || rm -f "$file"   # never the shared copy
           {
             echo "CARGO_TESTS_TARGET_DIR=$td"
             echo "CARGO_TESTS_WORKSPACE=$ws"
@@ -418,7 +457,7 @@ jobs:
           NAME: ${{ inputs.name }}
           ARTIFACT: ${{ inputs.archive-artifact }}
         run: |
-          echo "::warning title=$NAME::the test archive $ARTIFACT could not be downloaded or extracted (an artifact expires after cargo-tests-archive-retention-days), so this lane builds its own test binaries"
+          echo "::warning title=$NAME::the test archive $ARTIFACT could not be read (an artifact expires after cargo-tests-archive-retention-days; a shared-volume copy can be missing or fail its checksum) or extracted, so this lane builds its own test binaries"
 
       - name: Check there is a command to run
         if: >-
