@@ -1425,10 +1425,7 @@ jobs:
       matrix:
         entry: ${{ fromJson(needs.changes.outputs.cargo-tests-lanes || inputs.cargo-tests) }}
     # Pinned to this workflow's own major: the lanes need the v3 inputs.
-    # On `feat/cargo-tests-archive-dir` it points at the branch (the lanes
-    # need its new `archive-path` input) and goes back to `@v3` in the last
-    # commit before merge; `v3` then moves to the merge commit.
-    uses: jcttech/.github/.github/workflows/cargo-tests.yml@feat/cargo-tests-archive-dir
+    uses: jcttech/.github/.github/workflows/cargo-tests.yml@v3
     secrets: inherit
     with:
       # `${{ expr || 'default' }}` fallbacks here are load-bearing —
