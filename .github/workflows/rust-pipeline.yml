@@ -1277,9 +1277,8 @@ jobs:
       fail-fast: false
       matrix:
         entry: ${{ fromJson(needs.changes.outputs.cargo-tests-lanes || inputs.cargo-tests) }}
-    # On the `ci-diet-build-once` branch this points at the branch so the
-    # change can be exercised end to end; it is `@v3` from the release.
-    uses: jcttech/.github/.github/workflows/cargo-tests.yml@ci-diet-build-once
+    # Pinned to this workflow's own major: the lanes need the v3 inputs.
+    uses: jcttech/.github/.github/workflows/cargo-tests.yml@v3
     secrets: inherit
     with:
       # `${{ expr || 'default' }}` fallbacks here are load-bearing —
