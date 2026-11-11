@@ -222,6 +222,22 @@ on:
         description: |
           Retention of the test-archive artifacts. A lane re-run after they
           expired builds its own test binaries (with a warning).
+      cargo-tests-archive-dir:
+        type: string
+        default: ''
+        description: |
+          A directory on a shared cache volume (K8s NFS, like rust-setup's
+          `shared-cache`) that every job of the run can read and write, e.g.
+          `/cache/cargo-tests-archive`. When set, the test archives are
+          written there (`<dir>/<owner>/<repo>/<run_id>/…`, SHA-256 beside
+          each) and the lanes read them in place: no artifact upload or
+          download, no Actions storage, no `actions: write`. Empty (the
+          default): GitHub artifacts. If the directory isn't on a mounted
+          volume or isn't writable in the archive job, the run falls back to
+          artifacts with a notice; a lane that can't find or verify its
+          archive builds its own test binaries, as for an expired artifact.
+          Trust: any job on those runners can read and write the volume, as
+          with sccache.
       cargo-tests-archive-cleanup:
         type: boolean
         default: true
@@ -800,6 +816,7 @@ jobs:
       status: ${{ steps.ready.outputs.status || steps.features.outputs.status }}
       excluded: ${{ steps.features.outputs.excluded }}
       lane-archives: ${{ steps.archive.outputs.lane-archives }}
+      transport: ${{ steps.archive.outputs.transport }}
       target-dir: ${{ steps.archive.outputs.target-dir }}
       workspace-root: ${{ steps.archive.outputs.workspace-root }}
       github-workspace: ${{ steps.archive.outputs.github-workspace }}
@@ -807,6 +824,7 @@ jobs:
     env:
       ARCHIVE_PLAN: ${{ needs.changes.outputs.cargo-tests-archive }}
       CT_MANIFEST: ${{ inputs.cargo-tests-manifest-path }}
+      ARCHIVE_ROOT: ${{ inputs.cargo-tests-archive-dir }}
     steps:
       - uses: actions/checkout@v5
 
@@ -846,6 +864,84 @@ jobs:
             [ -n "$CT_BUILD_JOBS" ] && echo "CARGO_BUILD_JOBS=$CT_BUILD_JOBS"
             printf '%s\n' "$CT_BUILD_ENV" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d' -e '/^#/d'
           } | tee -a "$GITHUB_ENV"
+
+      # ── The shared archive directory (cargo-tests-archive-dir) ────────
+      # Checks it's on a mounted volume and writable here, sweeps run
+      # directories older than the retention under <dir>/<owner>/<repo>,
+      # and reports the volume. Any problem: artifacts, with a notice.
+      - name: Shared archive directory
+        id: shared
+        if: inputs.cargo-tests-archive-dir != ''
+        shell: bash
+        env:
+          RETENTION_DAYS: ${{ inputs.cargo-tests-archive-retention-days }}
+        run: |
+          set -uo pipefail -f
+          out() { echo "$1=$2" >> "$GITHUB_OUTPUT"; }
+          fallback() {
+            echo "::notice title=cargo-tests archive dir::$1; this run's test archives go to GitHub artifacts instead"
+            { echo "## cargo-tests: shared archive directory"; echo; echo "$1; this run's test archives go to GitHub artifacts instead."; } >> "$GITHUB_STEP_SUMMARY"
+            out transport artifact
+            exit 0
+          }
+          # rm_run_path <path>: delete one run's directory (or one pipeline call's
+          # directory inside it) under $ARCHIVE_ROOT/$GITHUB_REPOSITORY, and nothing
+          # else, ever. The shared volume holds other things (sccache beside it).
+          rm_run_path() {
+            local p="$1" root base rp rel sc why=""
+            if [ -z "$p" ]; then why="empty path"
+            elif [ "${p#/}" = "$p" ]; then why="not an absolute path"
+            elif case "/$p/" in */../*|*/./*) true ;; *) false ;; esac; then why="contains . or .. segments"
+            elif [ -L "$p" ]; then why="is a symlink"
+            elif [ -z "${ARCHIVE_ROOT:-}" ] || ! root=$(realpath -e -- "$ARCHIVE_ROOT" 2>/dev/null) || [ -z "$root" ] || [ "$root" = / ]; then why="cargo-tests-archive-dir (${ARCHIVE_ROOT:-empty}) is empty, / or doesn't resolve"
+            elif ! base=$(realpath -e -- "$ARCHIVE_ROOT/$GITHUB_REPOSITORY" 2>/dev/null) || [ "$base" != "$root/$GITHUB_REPOSITORY" ]; then why="$ARCHIVE_ROOT/$GITHUB_REPOSITORY doesn't resolve to itself"
+            elif [ ! -e "$p" ]; then return 0
+            elif ! rp=$(realpath -e -- "$p" 2>/dev/null); then why="doesn't resolve"
+            elif [ "${rp#"$base"/}" = "$rp" ]; then why="not under $base"
+            else
+              rel="${rp#"$base"/}"
+              if ! printf '%s' "$rel" | grep -qxE '[0-9]+(/cargo-tests-archive-[0-9a-f]+)?'; then why="not a run directory under $base"
+              elif [ -n "${SCCACHE_DIR:-}" ]; then
+                sc=$(realpath -m -- "$SCCACHE_DIR")
+                case "$sc/" in "$rp"/*) why="contains SCCACHE_DIR ($sc)" ;; esac
+                case "$rp/" in "$sc"/*) why="is inside SCCACHE_DIR ($sc)" ;; esac
+              fi
+            fi
+            if [ -n "$why" ]; then
+              echo "::warning title=cargo-tests archive dir::refusing to delete '$p': $why"
+              return 1
+            fi
+            rm -rf -- "$rp"
+          }
+          case "$ARCHIVE_ROOT" in /?*) ;; *) fallback "cargo-tests-archive-dir must be an absolute path below / (got '$ARCHIVE_ROOT')" ;; esac
+          printf '%s' "$GITHUB_REPOSITORY" | grep -qxE '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+' || fallback "unexpected repository name '$GITHUB_REPOSITORY'"
+          case "$GITHUB_REPOSITORY" in *..*) fallback "unexpected repository name '$GITHUB_REPOSITORY'" ;; esac
+          printf '%s' "$GITHUB_RUN_ID" | grep -qxE '[0-9]+' || fallback "unexpected run id '$GITHUB_RUN_ID'"
+          parent=$(dirname "$ARCHIVE_ROOT")
+          [ -d "$parent" ] || fallback "$parent doesn't exist in this job's container (is the shared volume mounted?)"
+          mnt=$(df -P "$parent" 2>/dev/null | awk 'NR == 2 { print $6 }')
+          if [ -z "$mnt" ] || [ "$mnt" = / ]; then fallback "$parent is on the container's own filesystem, not a mounted volume"; fi
+          repo_dir="$ARCHIVE_ROOT/$GITHUB_REPOSITORY"
+          mkdir -p "$repo_dir/$GITHUB_RUN_ID" 2>/dev/null || fallback "can't create $repo_dir/$GITHUB_RUN_ID"
+          probe="$repo_dir/$GITHUB_RUN_ID/.write-probe.$$"
+          { echo probe > "$probe" && rm -f "$probe"; } 2>/dev/null || fallback "$repo_dir/$GITHUB_RUN_ID isn't writable"
+          # Sweep: run directories older than the retention, this run's excepted.
+          swept=0
+          mins=$(( ${RETENTION_DAYS:-1} * 1440 ))
+          while IFS= read -r -d '' d; do
+            [ "$(basename "$d")" = "$GITHUB_RUN_ID" ] && continue
+            rm_run_path "$d" && swept=$((swept + 1))
+          done < <(find "$repo_dir" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' -mmin +"$mins" -print0 2>/dev/null)
+          fstype=$(stat -f -c %T "$ARCHIVE_ROOT" 2>/dev/null || echo unknown)
+          free=$(df -Pk "$ARCHIVE_ROOT" | awk 'NR == 2 { print $4 * 1024 }')
+          out transport dir
+          out run-dir "$repo_dir/$GITHUB_RUN_ID"
+          out free-before "$free"
+          {
+            echo "## cargo-tests: shared archive directory"
+            echo
+            echo "\`$repo_dir/$GITHUB_RUN_ID\` on $mnt ($fstype): $(awk -v b="$free" 'BEGIN { printf "%.1f GiB", b / 1073741824 }') free before the build; swept $swept run director$([ "$swept" -eq 1 ] && echo y || echo ies) older than ${RETENTION_DAYS:-1} day(s)."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Feature unification check
         id: features
@@ -964,6 +1060,8 @@ jobs:
           FEATS: ${{ steps.features.outputs.features }}
           ARCHIVE_LANES: ${{ steps.features.outputs.lanes }}
           CT_BUILD_WRAPPER: ${{ inputs.cargo-tests-build-wrapper }}
+          TRANSPORT: ${{ steps.shared.outputs.transport || 'artifact' }}
+          RUN_DIR: ${{ steps.shared.outputs.run-dir }}
         run: |
           set -euo pipefail -f
           slots=12   # upload steps below; lanes beyond that share a slot's artifact
@@ -990,14 +1088,47 @@ jobs:
               "$@"
             fi
             size=$(stat -c %s "$dir/slot-$slot/$file"); total=$(( total + size ))
-            echo "slot-$slot=true" >> "$GITHUB_OUTPUT"
-            archives=$(jq -c --arg n "$n" --arg a "$ARTIFACT-$slot" --arg f "$file" '. + {($n): {artifact: $a, file: $f}}' <<<"$archives")
+            archives=$(jq -c --arg n "$n" --arg a "$ARTIFACT-$slot" --arg f "$file" --arg s "slot-$slot" '. + {($n): {artifact: $a, file: $f, slot: $s}}' <<<"$archives")
             rows+="| $n | \`$expr\` | $(awk -v b="$size" 'BEGIN { printf "%.0f MiB", b / 1048576 }') | $(( $(date +%s) - t0 ))s |"$'\n'
           done
           secs=$(( $(date +%s) - start ))
           meta=$(cargo metadata --no-deps --format-version 1 --manifest-path "$manifest")
+          mib() { awk -v b="$1" 'BEGIN { printf "%.0f MiB", b / 1048576 }'; }
+
+          # The shared directory: each lane's archive written to a temporary
+          # name, its SHA-256 beside it, then renamed, so a lane never reads
+          # a partial file. Any failure: artifacts after all.
+          written=""
+          if [ "$TRANSPORT" = dir ]; then
+            dest="$RUN_DIR/$ARTIFACT"; w0=$(date +%s); ok=true
+            mkdir -p "$dest" || ok=false
+            mapfile -t names < <(jq -r 'keys[]' <<<"$archives")
+            for n in "${names[@]}"; do
+              [ "$ok" = true ] || break
+              slot=$(jq -r --arg n "$n" '.[$n].slot' <<<"$archives"); file=$(jq -r --arg n "$n" '.[$n].file' <<<"$archives")
+              src="$dir/$slot/$file"; tmp="$dest/.$file.tmp.$$"
+              if cp -- "$src" "$tmp" && sha256sum "$src" | awk -v f="$file" '{ print $1 "  " f }' > "$tmp.sha256" \
+                 && mv -f -- "$tmp.sha256" "$dest/$file.sha256" && mv -f -- "$tmp" "$dest/$file"; then
+                archives=$(jq -c --arg n "$n" --arg p "$dest/$file" '.[$n].path = $p' <<<"$archives")
+              else
+                ok=false; rm -f -- "$tmp" "$tmp.sha256"
+              fi
+            done
+            if [ "$ok" = true ]; then
+              written="Wrote $(mib "$total") to \`$dest\` in $(( $(date +%s) - w0 ))s (no upload)."
+              rm -rf -- "$dir"
+            else
+              echo "::notice title=cargo-tests archive dir::writing the test archives to $dest failed; this run's archives go to GitHub artifacts instead"
+              archives=$(jq -c 'with_entries(.value |= del(.path))' <<<"$archives")
+              TRANSPORT=artifact
+            fi
+          fi
+          if [ "$TRANSPORT" = artifact ]; then
+            for s in $(jq -r '[.[].slot] | unique[]' <<<"$archives"); do echo "$s=true" >> "$GITHUB_OUTPUT"; done
+          fi
           echo "CARGO_TESTS_UPLOAD_T0=$(date +%s)" >> "$GITHUB_ENV"
           {
+            echo "transport=$TRANSPORT"
             echo "dir=$dir"
             echo "total-bytes=$total"
             echo "lane-archives=$archives"
@@ -1005,11 +1136,11 @@ jobs:
             echo "workspace-root=$(jq -r .workspace_root <<<"$meta")"
             echo "github-workspace=$GITHUB_WORKSPACE"
           } >> "$GITHUB_OUTPUT"
-          mib() { awk -v b="$1" 'BEGIN { printf "%.0f MiB", b / 1048576 }'; }
           {
             echo "## cargo-tests archive"
             echo
             echo "Built once: \`$PKGS\`${FEATS:+, features \`$FEATS\`}; CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-unset}; build $((build_secs / 60))m$((build_secs % 60))s, build + archives $((secs / 60))m$((secs % 60))s, $(mib "$total") in all."
+            [ -n "$written" ] && { echo; echo "$written"; }
             echo
             echo "| Lane | Archived binaries | Archive | Time |"
             echo "|---|---|---|---|"
@@ -1155,7 +1286,23 @@ jobs:
         env:
           TOTAL: ${{ steps.archive.outputs.total-bytes }}
           WARN_MIB: ${{ inputs.cargo-tests-archive-warn-mib }}
+          TRANSPORT: ${{ steps.archive.outputs.transport }}
+          FREE_BEFORE: ${{ steps.shared.outputs.free-before }}
         run: |
+          if [ "$TRANSPORT" = dir ]; then
+            free=$(df -Pk "$ARCHIVE_ROOT" | awk 'NR == 2 { print $4 * 1024 }')
+            {
+              echo
+              echo "Shared volume: $(awk -v b="${FREE_BEFORE:-0}" 'BEGIN { printf "%.1f GiB", b / 1073741824 }') free before the build, $(awk -v b="$free" 'BEGIN { printf "%.1f GiB", b / 1073741824 }') after writing $(( TOTAL / 1048576 )) MiB."
+            } >> "$GITHUB_STEP_SUMMARY"
+            if [ "$free" -lt $(( 4 * TOTAL )) ]; then
+              msg="the shared volume under $ARCHIVE_ROOT has $(( free / 1048576 )) MiB free, under four times this run's $(( TOTAL / 1048576 )) MiB of test archives: concurrent runs could fill it (and sccache shares it). Free space, lower cargo-tests-archive-retention-days, or unset cargo-tests-archive-dir."
+              echo "::warning title=cargo-tests archive dir::$msg"
+              { echo; echo "> **Warning:** $msg"; } >> "$GITHUB_STEP_SUMMARY"
+            fi
+            echo "status=ready" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           secs=$(( $(date +%s) - ${CARGO_TESTS_UPLOAD_T0:-$(date +%s)} ))
           mib=$(( TOTAL / 1048576 ))
           rate=$(awk -v b="$TOTAL" -v s="$secs" 'BEGIN { if (s > 0) printf "%.1f MB/s", b / s / 1e6; else print "n/a" }')
@@ -1311,6 +1458,7 @@ jobs:
              (fromJson(needs.cargo-tests-archive.outputs.lane-archives || '{}')[matrix.entry.name].artifact ||
               format('{0}-missing', fromJson(needs.changes.outputs.cargo-tests-archive).artifact))) || '' }}
       archive-file: ${{ fromJson(needs.cargo-tests-archive.outputs.lane-archives || '{}')[matrix.entry.name].file || '' }}
+      archive-path: ${{ fromJson(needs.cargo-tests-archive.outputs.lane-archives || '{}')[matrix.entry.name].path || '' }}
       archive-status: ${{ needs.cargo-tests-archive.outputs.status || needs.cargo-tests-archive.result }}
       archive-command: ${{ matrix.entry.archive-command || '' }}
       archive-target-dir: ${{ needs.cargo-tests-archive.outputs.target-dir }}
@@ -1346,8 +1494,54 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PREFIX: ${{ fromJson(needs.changes.outputs.cargo-tests-archive).artifact }}-
+          ARTIFACT: ${{ fromJson(needs.changes.outputs.cargo-tests-archive).artifact }}
+          TRANSPORT: ${{ needs.cargo-tests-archive.outputs.transport }}
+          ARCHIVE_ROOT: ${{ inputs.cargo-tests-archive-dir }}
         run: |
           set -uo pipefail
+          if [ "$TRANSPORT" = dir ]; then
+            # Shared directory: delete this pipeline call's archives, then the
+            # run directory once nothing else (another call) is left in it.
+            # rm_run_path <path>: delete one run's directory (or one pipeline call's
+            # directory inside it) under $ARCHIVE_ROOT/$GITHUB_REPOSITORY, and nothing
+            # else, ever. The shared volume holds other things (sccache beside it).
+            rm_run_path() {
+              local p="$1" root base rp rel sc why=""
+              if [ -z "$p" ]; then why="empty path"
+              elif [ "${p#/}" = "$p" ]; then why="not an absolute path"
+              elif case "/$p/" in */../*|*/./*) true ;; *) false ;; esac; then why="contains . or .. segments"
+              elif [ -L "$p" ]; then why="is a symlink"
+              elif [ -z "${ARCHIVE_ROOT:-}" ] || ! root=$(realpath -e -- "$ARCHIVE_ROOT" 2>/dev/null) || [ -z "$root" ] || [ "$root" = / ]; then why="cargo-tests-archive-dir (${ARCHIVE_ROOT:-empty}) is empty, / or doesn't resolve"
+              elif ! base=$(realpath -e -- "$ARCHIVE_ROOT/$GITHUB_REPOSITORY" 2>/dev/null) || [ "$base" != "$root/$GITHUB_REPOSITORY" ]; then why="$ARCHIVE_ROOT/$GITHUB_REPOSITORY doesn't resolve to itself"
+              elif [ ! -e "$p" ]; then return 0
+              elif ! rp=$(realpath -e -- "$p" 2>/dev/null); then why="doesn't resolve"
+              elif [ "${rp#"$base"/}" = "$rp" ]; then why="not under $base"
+              else
+                rel="${rp#"$base"/}"
+                if ! printf '%s' "$rel" | grep -qxE '[0-9]+(/cargo-tests-archive-[0-9a-f]+)?'; then why="not a run directory under $base"
+                elif [ -n "${SCCACHE_DIR:-}" ]; then
+                  sc=$(realpath -m -- "$SCCACHE_DIR")
+                  case "$sc/" in "$rp"/*) why="contains SCCACHE_DIR ($sc)" ;; esac
+                  case "$rp/" in "$sc"/*) why="is inside SCCACHE_DIR ($sc)" ;; esac
+                fi
+              fi
+              if [ -n "$why" ]; then
+                echo "::warning title=cargo-tests archive dir::refusing to delete '$p': $why"
+                return 1
+              fi
+              rm -rf -- "$rp"
+            }
+            run_dir="$ARCHIVE_ROOT/$GITHUB_REPOSITORY/$GITHUB_RUN_ID"
+            msg="Every lane passed: deleted \`$run_dir/$ARTIFACT\`."
+            if ! rm_run_path "$run_dir/$ARTIFACT"; then
+              msg="Kept \`$run_dir/$ARTIFACT\`: the delete guard refused it (see the warning); the sweep at the next archive job's start applies the same guard."
+            elif [ -d "$run_dir" ] && [ -z "$(ls -A "$run_dir" 2>/dev/null)" ]; then
+              rm_run_path "$run_dir" || true
+            fi
+            echo "::notice title=cargo-tests archive cleanup::$msg"
+            { echo "## cargo-tests archive cleanup"; echo; echo "$msg"; echo; echo "Shared volume: $(df -Pk "$ARCHIVE_ROOT" | awk 'NR == 2 { printf "%.1f GiB free", $4 / 1048576 }')."; } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           api="${GITHUB_API_URL:-https://api.github.com}/repos/$GITHUB_REPOSITORY/actions"
           auth=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28")
           note() {
