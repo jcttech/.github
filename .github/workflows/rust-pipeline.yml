@@ -502,7 +502,10 @@ jobs:
           manifest="\"\$GITHUB_WORKSPACE\"/$(sq "$CT_MANIFEST")"
 
           nextest=false
-          if command -v cargo-nextest >/dev/null 2>&1; then nextest=true; fi
+          # cargo finds subcommands on PATH and in $CARGO_HOME/bin.
+          if command -v cargo-nextest >/dev/null 2>&1 || [ -x "${CARGO_HOME:-$HOME/.cargo}/bin/cargo-nextest" ]; then
+            nextest=true
+          fi
 
           # The per-lane path filters (pull requests only; any doubt runs the lane).
           matched='[]'; filter_ok=false
