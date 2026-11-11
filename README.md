@@ -110,6 +110,38 @@ Complete CI/CD for Rust projects: change detection, build, clippy, test, Docker,
 | `web-build-container-image` | string | `ghcr.io/jcttech/devcontainer-rust-leptos:latest` | Container image for the web-build job pod (must carry the WASM toolchain) |
 | `web-build-code-paths` | string | `''` | D1 fast-lane glob list |
 
+**Cargo-tests sub-job (`cargo-tests.yml`, matrix; build once, run everywhere since `@v3`):**
+
+| Input | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enable-cargo-tests` | boolean | `false` | Opt into the matrix of test lanes (one status check per lane: `cargo-tests (<name>) / <name>`) |
+| `cargo-tests` | string | `[]` | JSON array of lanes (fields below) |
+| `cargo-tests-build-once` | boolean | `true` | Build the triggered structured lanes' test binaries once (`cargo-tests-archive` job, `cargo nextest archive`) and run every lane from the archive. `false`: every lane builds itself (v2 behaviour) |
+| `cargo-tests-manifest-path` | string | `Cargo.toml` | Repo-root-relative workspace manifest the structured lanes build from |
+| `cargo-tests-build-jobs` | string | `1` | `CARGO_BUILD_JOBS` for the archive build and for structured lanes that build themselves (`''` = unset). Conservative on purpose; raise it on measured memory headroom |
+| `cargo-tests-build-env` | string | `''` | `KEY=VALUE` lines exported for every build the pipeline composes (not for a free-form `command`) |
+| `cargo-tests-build-wrapper` | string | `''` | Prefix the archive build runs under (e.g. a memory probe) |
+| `cargo-tests-feature-check` | string | `report` | `report` / `strict` / `off` — Cargo unifies features across one build's packages; `report` lists the workspace crates whose features differ from a lane-alone build, `strict` builds such lanes on their own |
+| `cargo-tests-archive-retention-days` | number | `1` | Retention of the archive artifact; a lane re-run after expiry builds itself |
+
+Lane fields: `name` (required), `command`, `with-postgres`, `postgres-image`, `pre-test-script`, `init-sql`, `code-paths`, `working-directory` (as in v2), and the structured fields `packages` (the `-p` list; makes the lane eligible for the archive), `features`, `profile`, `filter` (nextest filterset, ANDed with the packages), `nextest-args`, `doctests` (`'true'`/`'false'`), `setup` (shell before the tests, same step), `test-wrapper`, `build-once` (`'false'` = always build itself), `build-jobs`.
+
+How a run goes: the `changes` job evaluates every lane's `code-paths` (pull requests only, fail-open) and plans each triggered lane as *archive* or *per-lane*. A lane builds itself when the pipeline opts out (`cargo-tests-build-once: false`), the lane opts out, it has no `packages` (a free-form `command` can't be shared), the image lacks `cargo-nextest`, fewer than two triggered lanes qualify, or `cargo-tests-feature-check: strict` moves it off. With two or more archive lanes, `cargo-tests-archive` archives the union of **their** packages and features, uploads it, and runs `cargo test --doc` once against the same build (nextest archives carry no doc tests); each lane downloads the archive, runs `cargo nextest run -E '(package(=…) | …) & (<filter>)'` from it, and fails on its own packages' doc-test result. A re-run of a failed lane reuses the archive. If the archive job fails, every archive lane fails with a pointer to it.
+
+```yaml
+      enable-cargo-tests: true
+      cargo-tests-manifest-path: app/Cargo.toml
+      cargo-tests-build-env: |
+        CARGO_PROFILE_DEV_DEBUG=line-tables-only
+      cargo-tests: |
+        [
+          {"name": "Unit", "packages": "core util", "profile": "ci", "doctests": "true",
+           "code-paths": "app/crates/core/**\napp/crates/util/**"},
+          {"name": "Integration", "packages": "server", "profile": "ci", "filter": "not group(slow)",
+           "with-postgres": "true", "pre-test-script": "./scripts/ci/db.sh",
+           "setup": "bash scripts/ci/redis-up.sh && export REDIS_URL=redis://127.0.0.1:6379"}
+        ]
+
 **Example with custom options:**
 ```yaml
 jobs:
@@ -435,6 +467,8 @@ This repo uses a **single major-rolling tag** convention. Consumers normally pin
 | Tag | Tip points at |
 |---|---|
 | `@v1` | the latest commit on `main` considered backwards-compatible with the original `@v1` API. Force-moved forward as additive sibling workflows and additive optional inputs land. |
+| `@v2` | `rust-pipeline.yml` with the matrix-driven `cargo-tests` sub-job (the `enable-database-tests` path removed). Each lane builds its own test binaries. |
+| `@v3` | `rust-pipeline.yml` / `cargo-tests.yml` with build once, run everywhere as the default for structured lanes (jcttech/trading#1160). Lane checks are `cargo-tests (<name>) / <name>`; new check `cargo-tests-archive`. |
 
 **Why a single rolling tag (rather than cutting `@v2` for every additive opt-in moment)?**
 
