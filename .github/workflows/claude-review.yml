@@ -23,6 +23,34 @@ on:
         type: string
         default: ''
         description: 'Additional review instructions appended to the default prompt'
+      fail-on-missing-review:
+        type: boolean
+        default: true
+        description: >-
+          Fail the job when the reviewer ends without posting a review on the head commit
+          (after a "review could not complete" comment on the PR, or after posting its
+          unposted draft as an incomplete review). False keeps the job green and only
+          warns. A re-review that legitimately posts nothing (every finding is already an
+          open thread) never fails.
+    outputs:
+      review-posted:
+        description: "'true' when a review by github-actions[bot] is on the head commit at the end of the run."
+        value: ${{ jobs.review.outputs.review-posted }}
+      review-state:
+        description: 'The state of that review (APPROVED, CHANGES_REQUESTED, COMMENTED); empty when none.'
+        value: ${{ jobs.review.outputs.review-state }}
+      review-outcome:
+        description: >-
+          posted (the reviewer posted it); salvaged (the reviewer didn't finish, and the
+          workflow posted its unposted draft as an incomplete review); no-new-findings (a
+          re-review whose findings are all open threads already); superseded (no review,
+          but a newer commit was pushed during the run, and its own run reviews it); or
+          missing (no review). salvaged and missing fail the job unless
+          fail-on-missing-review is false. Empty when the job was skipped (a draft).
+        value: ${{ jobs.review.outputs.review-outcome }}
+      review-failure-reason:
+        description: One line saying why the review is missing or incomplete; empty otherwise.
+        value: ${{ jobs.review.outputs.review-failure-reason }}
     # Declared explicitly so callers can pass named secrets instead of
     # `secrets: inherit` (least-privilege trust boundary). Both are optional
     # because either credential alone is sufficient for claude-code-action.
@@ -45,16 +73,230 @@ jobs:
       pull-requests: write
       issues: write
       id-token: write
+    outputs:
+      review-posted: ${{ steps.verify.outputs.posted }}
+      review-state: ${{ steps.verify.outputs.state }}
+      review-outcome: ${{ steps.verify.outputs.outcome }}
+      review-failure-reason: ${{ steps.verify.outputs.reason }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
+      # The reviewer never has to hold the whole diff at once. A large PR's diff (trading
+      # #1158: 76 files, 886 KB, opening with 142 KB of 20,000-character Markdown table
+      # rows) is far past what one tool call returns, and paging through `gh pr diff`
+      # output needs commands the reviewer isn't allowed (sed, awk, redirection). So the
+      # diff is split here, one annotated file (or part, at most ~40 KB) per changed file,
+      # each line carrying its new and old line numbers, plus an index; the reviewer reads
+      # the parts with the Read tool. lines.json (the commentable lines) lets the verify
+      # step place a salvaged draft's inline comments.
+      - name: Prepare the diff for review
+        id: prep
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REVIEW_DIR: ${{ runner.temp }}/claude-review
+          JOB_TIMEOUT: ${{ inputs.timeout-minutes }}
+        run: |
+          set -euo pipefail
+          # Leave the post-steps a few minutes inside the job's limit: a Claude step that
+          # runs into the job timeout would take the "review could not complete" check with it.
+          t=${JOB_TIMEOUT%.*}
+          if [ "$t" -ge 10 ]; then t=$((t - 4)); elif [ "$t" -ge 3 ]; then t=$((t - 1)); fi
+          {
+            echo "dir=$REVIEW_DIR"
+            echo "claude-timeout=$t"
+          } >> "$GITHUB_OUTPUT"
+
+          rm -rf "$REVIEW_DIR"
+          mkdir -p "$REVIEW_DIR/files"
+          date -u +%Y-%m-%dT%H:%M:%SZ > "$REVIEW_DIR/started-at"
+
+          # GitHub's own diff (the one review comments are placed on). The API refuses a
+          # diff over 20,000 lines or 300 files; the same three-dot diff from git then.
+          if gh pr diff "$PR" > "$REVIEW_DIR/full.diff" 2> "$REVIEW_DIR/gh-diff.err"; then
+            echo "gh pr diff" > "$REVIEW_DIR/source"
+          else
+            echo "::notice title=Claude Review::gh pr diff failed ($(head -c 300 "$REVIEW_DIR/gh-diff.err" | tr '\n' ' ')); using git diff ${BASE_SHA:0:7}...${HEAD_SHA:0:7}"
+            # (the checkout is the merge commit: HEAD^1 is the base it merged, HEAD^2 the head)
+            if git -c core.quotePath=false diff --no-color --no-ext-diff -M "$BASE_SHA...$HEAD_SHA" > "$REVIEW_DIR/full.diff"; then
+              echo "git diff ${BASE_SHA:0:7}...${HEAD_SHA:0:7}" > "$REVIEW_DIR/source"
+            else
+              git -c core.quotePath=false diff --no-color --no-ext-diff -M HEAD^1...HEAD^2 > "$REVIEW_DIR/full.diff"
+              echo "git diff HEAD^1...HEAD^2" > "$REVIEW_DIR/source"
+            fi
+          fi
+
+          python3 - <<'PYEOF'
+          import json, os, re
+
+          d = os.environ['REVIEW_DIR']
+          pr = os.environ['PR']
+          MAX_LINE = 1600       # characters kept of one diff line
+          PART_BYTES = 40_000   # target size of one part file
+          raw = open(f'{d}/full.diff', encoding='utf-8', errors='replace').read()
+          source = open(f'{d}/source').read().strip()
+
+          def unquote(p):
+              p = p.rstrip('\t')
+              if len(p) >= 2 and p[0] == '"' and p[-1] == '"':
+                  try:
+                      return p[1:-1].encode('latin-1', 'backslashreplace').decode('unicode_escape').encode('latin-1').decode('utf-8')
+                  except Exception:
+                      return p[1:-1]
+              return p
+
+          hunk_re = re.compile(r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$')
+          files, cur, hunk = [], None, None
+          old_left = new_left = 0
+          for line in raw.split('\n'):
+              if hunk is not None and (old_left > 0 or new_left > 0 or line.startswith('\\')):
+                  tag, text = line[:1], line[1:]
+                  if tag == '\\':
+                      hunk['lines'].append((None, None, '\\', text))
+                  elif tag == '+':
+                      hunk['lines'].append((hunk['new'], None, '+', text))
+                      hunk['new'] += 1; new_left -= 1; cur['add'] += 1
+                  elif tag == '-':
+                      hunk['lines'].append((None, hunk['old'], '-', text))
+                      hunk['old'] += 1; old_left -= 1; cur['del'] += 1
+                  else:
+                      hunk['lines'].append((hunk['new'], hunk['old'], ' ', text))
+                      hunk['new'] += 1; hunk['old'] += 1; new_left -= 1; old_left -= 1
+                  continue
+              hunk = None
+              if line.startswith('diff --git '):
+                  m = re.match(r'diff --git "?a/(.*?)"? "?b/(.*?)"?$', line)
+                  cur = {'path': unquote(m.group(2)) if m else line[11:], 'old_path': unquote(m.group(1)) if m else None,
+                         'status': 'modified', 'add': 0, 'del': 0, 'hunks': [], 'binary': False}
+                  files.append(cur)
+                  continue
+              if cur is None:
+                  continue
+              m = hunk_re.match(line)
+              if m:
+                  old_left = int(m.group(2)) if m.group(2) is not None else 1
+                  new_left = int(m.group(4)) if m.group(4) is not None else 1
+                  hunk = {'header': line, 'old': int(m.group(1)), 'new': int(m.group(3)), 'lines': []}
+                  cur['hunks'].append(hunk)
+              elif line.startswith('new file mode'):
+                  cur['status'] = 'added'
+              elif line.startswith('deleted file mode'):
+                  cur['status'] = 'deleted'
+              elif line.startswith('rename from '):
+                  cur['status'], cur['old_path'] = 'renamed', unquote(line[12:])
+              elif line.startswith('rename to '):
+                  cur['path'] = unquote(line[10:])
+              elif line.startswith('--- ') and line[4:].rstrip('\t') != '/dev/null':
+                  cur['old_path'] = unquote(line[4:])[2:]
+              elif line.startswith('+++ '):
+                  p = line[4:].rstrip('\t')
+                  cur['path'] = cur['old_path'] if p == '/dev/null' else unquote(p)[2:]
+              elif line.startswith('Binary files') or line.startswith('GIT binary patch'):
+                  cur['binary'] = True
+
+          def kind(path):
+              p, name = path.lower(), path.lower().rsplit('/', 1)[-1]
+              if name in ('cargo.lock', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'poetry.lock', 'uv.lock', 'go.sum') \
+                      or 'openapi' in name or name.endswith(('.snap', '.min.js', '.min.css', '.svg')):
+                  return 'generated'
+              if name.endswith(('.md', '.mdx', '.rst', '.txt', '.adoc')) or re.search(r'(^|/)\.?docs?/', p):
+                  return 'docs'
+              if '/tests/' in '/' + p or '/test/' in '/' + p or re.search(r'(^|[_.-])tests?[_.-]|_tests?\.\w+$|\.(test|spec)\.\w+$', name):
+                  return 'test'
+              if name.endswith(('.toml', '.yml', '.yaml', '.json', '.ini', '.cfg', '.lock')) or name.startswith(('dockerfile', 'makefile', '.')):
+                  return 'config'
+              return 'code'
+
+          RANK = {'code': 0, 'test': 1, 'config': 2, 'docs': 3, 'generated': 4}
+          for f in files:
+              f['kind'] = kind(f['path'])
+          files.sort(key=lambda f: (RANK[f['kind']], f['path']))
+
+          def fmt(new, old, tag, text):
+              if len(text) > MAX_LINE:
+                  text = f'{text[:MAX_LINE]} …[{len(text) - MAX_LINE} more characters cut; the whole line is in full.diff]'
+              if tag == '\\':
+                  return f'{"":>13}  \\{text}'
+              return f'{"" if new is None else new:>6} {"" if old is None else old:>6} {tag} {text}'
+
+          lines_map, rows = {}, []
+          for i, f in enumerate(files, 1):
+              right, left = set(), set()
+              blocks = []   # rendered hunks, each a list of lines
+              for h in f['hunks']:
+                  out = [h['header']]
+                  for new, old, tag, text in h['lines']:
+                      out.append(fmt(new, old, tag, text))
+                      if new is not None:
+                          right.add(new)
+                      if old is not None:
+                          left.add(old)
+                  blocks.append(out)
+              lines_map[f['path']] = {'RIGHT': sorted(right), 'LEFT': sorted(left)}
+              # Pack hunks into parts of about PART_BYTES; a bigger hunk is cut at a line.
+              parts, part, size = [], [], 0
+              for out in blocks:
+                  for j, l in enumerate(out):
+                      if size + len(l) > PART_BYTES and part:
+                          parts.append(part)
+                          part, size = [], 0
+                          if j > 0:
+                              part.append(f'{out[0]}  (hunk continued)')
+                      part.append(l)
+                      size += len(l) + 1
+              if part or not parts:
+                  parts.append(part)
+              slug = re.sub(r'[^A-Za-z0-9._-]+', '_', f['path'].replace('/', '__'))[-90:]
+              names = []
+              note = ' (binary: no text diff)' if f['binary'] else (' (no content change)' if not f['hunks'] else '')
+              renamed = f' (renamed from {f["old_path"]})' if f['status'] == 'renamed' else ''
+              for k, body in enumerate(parts, 1):
+                  name = f'files/{i:03d}-{slug}' + (f'.part{k}' if len(parts) > 1 else '') + '.diff'
+                  head = [f'# {f["path"]}{renamed} — {f["status"]}, +{f["add"]} -{f["del"]}'
+                          + (f' — part {k} of {len(parts)}' if len(parts) > 1 else '') + note,
+                          '#    NEW    OLD   (NEW = line on the PR side: inline comment `line`, side RIGHT; OLD = removed-side line, side LEFT)']
+                  text = '\n'.join(head + body) + '\n'
+                  open(f'{d}/{name}', 'w', encoding='utf-8').write(text)
+                  names.append(name)
+              rows.append(f'| {i} | {f["kind"]} | `{f["path"]}`{renamed} | {f["status"]} | +{f["add"]} | -{f["del"]} | '
+                          + ', '.join(f'`{n}`' for n in names) + ' |')
+
+          json.dump(lines_map, open(f'{d}/lines.json', 'w'))
+          open(f'{d}/files.txt', 'w').write(''.join(f['path'] + '\n' for f in files))
+          adds, dels = sum(f['add'] for f in files), sum(f['del'] for f in files)
+          nparts = sum(r.count('`files/') for r in rows)
+          index = [
+              f'# The diff of PR #{pr}, prepared for review',
+              '',
+              f'Source: `{source}`. {len(files)} files, +{adds} -{dels}, {len(raw.encode('utf-8')) // 1024} KB raw, in {nparts} part file(s).',
+              '',
+              f'Every path below is relative to `{d}/`. Read the part files with the Read tool, several in one turn.',
+              'Each line of a part is: NEW (the line number on the PR side; use it as an inline comment `line`,',
+              'side RIGHT), OLD (the removed side; side LEFT), the marker (`+` added, `-` removed, blank = context)',
+              f'and the text. Lines over {MAX_LINE} characters are cut and marked; `full.diff` is the raw diff.',
+              '',
+              'Files are ordered code, test, config, docs, generated (a kind is guessed from the path).',
+              '',
+              '| # | kind | file | status | + | - | read |',
+              '|---|---|---|---|---|---|---|',
+              *rows,
+          ]
+          open(f'{d}/index.md', 'w', encoding='utf-8').write('\n'.join(index) + '\n')
+          print(f'Prepared {len(files)} file(s), +{adds} -{dels}, {len(raw.encode('utf-8'))} bytes raw, into {nparts} part(s) under {d} (source: {source})')
+          if not files and raw.strip():
+              raise SystemExit('the diff is not empty but no file could be parsed from it')
+          PYEOF
+
       - name: Resolve addressed threads before review
         id: pre-resolve
         env:
           GH_TOKEN: ${{ github.token }}
+          REVIEW_DIR: ${{ steps.prep.outputs.dir }}
         run: |
           set -euo pipefail
           PR=${{ github.event.pull_request.number }}
@@ -80,9 +322,10 @@ jobs:
             }' > /tmp/review-threads.json 2>/dev/null || echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}' > /tmp/review-threads.json
 
           # Get the diff line ranges to detect which lines were modified in the latest push
-          # Also get list of files in the diff
-          gh pr diff "$PR" --name-only > /tmp/diff-files.txt 2>/dev/null || touch /tmp/diff-files.txt
-          gh pr diff "$PR" > /tmp/full-diff.txt 2>/dev/null || touch /tmp/full-diff.txt
+          # Also get list of files in the diff (the prepare step's copy: `gh pr diff` fails
+          # outright on a diff over GitHub's size limit, which used to leave both empty)
+          cp "$REVIEW_DIR/files.txt" /tmp/diff-files.txt
+          cp "$REVIEW_DIR/full.diff" /tmp/full-diff.txt
 
           # Resolve threads where the commented line was modified or the file was removed from the diff.
           # This breaks the circular dependency: fixed issues get resolved BEFORE Claude runs,
@@ -155,8 +398,9 @@ jobs:
               line = info['line']
               should_resolve = False
 
-              if path and path not in diff_files:
-                  # File no longer in the diff — thread is outdated
+              if path and diff_files and path not in diff_files:
+                  # File no longer in the diff — thread is outdated (an empty file list is an
+                  # unreadable diff, not a PR without files: resolve nothing on it)
                   should_resolve = True
               elif path and line and path in changed_lines:
                   # Check if the commented line falls within a changed hunk
@@ -191,6 +435,10 @@ jobs:
         # CLAUDE_CODE_OAUTH_TOKEN hitting its usage limit, not the action. That symptom
         # means "the first API call was rejected": check the subscription's usage (or the
         # token) before suspecting a version.
+        id: claude
+        # A few minutes short of the job's limit (the prepare step works it out), so the
+        # verify step below still runs when the reviewer is slow.
+        timeout-minutes: ${{ fromJSON(steps.prep.outputs.claude-timeout) }}
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -200,7 +448,9 @@ jobs:
           claude_args: |
             --model ${{ inputs.model }}
             --max-turns ${{ inputs.max-turns }}
+            --add-dir "${{ steps.prep.outputs.dir }}"
             --allowedTools "Read,Glob,Grep,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr comment:*),Bash(gh pr review:*),Bash(gh pr checks:*),Bash(gh api:*),Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(find:*),Bash(tree:*),Bash(file:*),Bash(echo:*),Bash(mktemp:*),Write"
+            --allowedTools "Bash(git blame:*),Bash(git cat-file:*),Bash(git ls-files:*),Bash(git merge-base:*),Bash(git rev-parse:*),Bash(git status:*),Bash(grep:*),Bash(cut:*),Bash(nl:*),Bash(jq:*)"
           prompt: |
             You are reviewing PR #${{ github.event.pull_request.number }} in ${{ github.repository }}.
             The PR branch is already checked out in the current working directory.
@@ -210,11 +460,11 @@ jobs:
             You MUST post your review as a **GitHub Pull Request Review** with inline comments
             on specific lines of the diff — NOT as a general PR comment.
 
-            Use the GitHub API to submit a review with inline comments:
+            Use the GitHub API to submit a review with inline comments. Write the payload to
+            `${{ steps.prep.outputs.dir }}/review.json` with the **Write tool** (a shell heredoc or a `>`
+            redirection into a file can be refused in this run):
 
-            ```bash
-            # Write review payload to a temp file, then submit
-            cat > /tmp/review.json << 'REVIEW_JSON'
+            ```json
             {
               "event": "REQUEST_CHANGES",
               "body": "### Summary\n...\n\n### Findings\n...",
@@ -226,10 +476,19 @@ jobs:
                 }
               ]
             }
-            REVIEW_JSON
-            gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews \
-              --input /tmp/review.json
             ```
+
+            then submit it:
+
+            ```bash
+            gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews --input ${{ steps.prep.outputs.dir }}/review.json
+            ```
+
+            If the API answers 422 (usually an inline comment on a line that isn't in the diff),
+            move those comments into the body and post again. Keep `${{ steps.prep.outputs.dir }}/review.json` as your
+            current draft: if the run ends before a review is posted, the workflow posts that draft
+            as an incomplete review (an APPROVE draft as a COMMENT). That's a safety net, not a
+            substitute — post the review yourself.
 
             ### Review Event Rules
             - **`REQUEST_CHANGES`**: Use when there are CRITICAL, HIGH, or MEDIUM findings
@@ -240,15 +499,28 @@ jobs:
             - **`COMMENT`**: do not use for findings. Reserve it for a review that could not finish (say what was skipped).
 
             CRITICAL: Always post a review, even if incomplete. A partial review is better than none.
+            A run that ends with no review on the head commit is reported as a failed review: the
+            workflow comments on the PR and fails the job. If you can't finish (turns running out,
+            files you can't read), post a **COMMENT** review with what you found, the files you did
+            not review and why. If you can't post at all, write `${{ steps.prep.outputs.dir }}/outcome.json` as
+            `{"outcome": "blocked", "reason": "<one line>"}` before you stop.
+
+            ### This run is non-interactive
+
+            Nobody can grant a permission here. When a tool call is refused, don't stop and don't
+            ask for permission: use the Read tool on the prepared files, or another allowed command,
+            and carry on. Allowed: Read, Glob, Grep, Write; `git diff|log|show|blame|cat-file|ls-files|merge-base|rev-parse|status`;
+            `gh pr diff|view|checks`, `gh api`; `ls`, `cat`, `head`, `tail`, `wc`, `grep`, `cut`, `nl`,
+            `jq`, `find`, `tree`, `file`, `echo`. Not allowed: `sed`, `awk`, scripting languages,
+            `cd`, and redirecting output to a file.
 
             ### Mapping Findings to Diff Lines
 
-            Each inline comment MUST reference a line that appears in the PR diff. To find the
-            correct line numbers:
-            1. Run `gh pr diff ${{ github.event.pull_request.number }}` to see the diff
-            2. Note the `+` lines and their line numbers (shown after `@@` markers)
-            3. Use the NEW file line number (right side of the diff) for the `line` field
-            4. The `path` must match the file path exactly as shown in the diff
+            Each inline comment MUST reference a line that appears in the PR diff. The prepared
+            diff (see "Reading the Diff") gives every line's numbers:
+            1. Use the NEW column as the `line` field (the PR side; `side` defaults to `RIGHT`)
+            2. For a removed line, use the OLD column as `line` and add `"side": "LEFT"`
+            3. The `path` must match the file path exactly as shown in the part file's `#` header
 
             If a finding applies to a range or general pattern rather than a specific line,
             include it in the review `body` summary instead of as an inline comment.
@@ -293,6 +565,8 @@ jobs:
                if every new finding is LOW, post **APPROVE** with the LOWs listed as follow-ups (they never block).
             3. `/tmp/unresolved-threads.json` has entries AND zero new findings (after dedup)
                → do NOT post a new review (existing threads already cover everything actionable).
+               Instead write `${{ steps.prep.outputs.dir }}/outcome.json` as `{"outcome": "no-new-findings", "reason": "<one line>"}`
+               with the Write tool: without it, a run that posts no review is reported as failed.
             4. `/tmp/unresolved-threads.json` has entries AND ≥1 new findings
                → post **REQUEST_CHANGES** with only the new findings if any is CRITICAL / HIGH / MEDIUM;
                if every new finding is LOW and every unresolved thread is LOW, post **APPROVE** with the LOWs as follow-ups.
@@ -302,20 +576,35 @@ jobs:
             "covered, accepted, do not re-post" — it does NOT count as a new finding.
             The APPROVE is needed to unblock the PR.
 
+            ## Reading the Diff
+
+            A previous step split the PR's diff into one file per changed file (large files into
+            parts of at most ~40 KB), each line annotated with its NEW and OLD line numbers:
+
+            - `${{ steps.prep.outputs.dir }}/index.md` — every changed file: its kind (code, test, config, docs,
+              generated), status, `+`/`-` counts and the part file(s) to read. Read it first.
+            - `${{ steps.prep.outputs.dir }}/files/*.diff` — the parts. Read them with the **Read tool**, several in one
+              turn (parallel tool calls). Code first, then tests; skim docs and generated files.
+            - `${{ steps.prep.outputs.dir }}/full.diff` — the raw diff, only for a line cut short in a part.
+
+            Don't page through `gh pr diff` output: on a large PR one call returns only the start of
+            it. For context beyond the diff, use Read/Glob/Grep on the checkout, or `git log`/`git show`.
+
             ## Process (follow this exact order)
 
             1. Read `/tmp/unresolved-threads.json` to see existing review threads from previous runs.
-            2. Run `gh pr diff ${{ github.event.pull_request.number }}` to get the full diff.
+            2. Read `${{ steps.prep.outputs.dir }}/index.md`, then the part files (see "Reading the Diff").
             3. If needed, use Read/Glob/Grep to examine specific changed files for more context.
             4. Formulate findings — skip anything already covered by an existing unresolved thread.
             5. Follow the re-review decision logic above to decide your review event type.
-            6. Build the review JSON payload with inline comments for new findings only.
-            7. Post via `gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews`.
+            6. Write the review JSON payload to `${{ steps.prep.outputs.dir }}/review.json` with inline comments for new findings only.
+            7. Post via `gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews --input ${{ steps.prep.outputs.dir }}/review.json`
+               and check the response; on a 422, fix the payload and post again.
             Note: Thread resolution and review dismissal happen automatically in a post-step.
 
             You have ${{ inputs.max-turns }} turns total. Budget your turns carefully:
-            - Use at most HALF for reading code.
-            - Reserve the LAST 2 turns for building and posting the review.
+            - Use at most HALF for reading code. Read several part files per turn.
+            - Reserve the LAST 3 turns for building and posting the review (and re-posting after a 422).
             - If you cannot review all files, review what you can and list the rest as unreviewed.
 
             ## Review Body Format
@@ -352,6 +641,283 @@ jobs:
             - Do NOT post a general `gh pr comment` — use the review API only
 
             ${{ inputs.review-extra }}
+
+      # The review must be on the head commit when the job ends. If it isn't: post the
+      # reviewer's unposted draft (DIR/review.json) as an incomplete review when there is
+      # one, otherwise comment on the PR saying why; either way fail the job (unless the
+      # caller set fail-on-missing-review: false). The reason comes from the action's execution file —
+      # the result's subtype and turns, the refused tool calls, the reviewer's last words —
+      # since the action keeps the transcript out of the log. A re-review that wrote
+      # outcome.json "no-new-findings" (rule 3) with open threads is not a failure.
+      - name: Verify the review was posted
+        id: verify
+        if: ${{ !cancelled() && github.event.pull_request.number }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REVIEW_DIR: ${{ steps.prep.outputs.dir }}
+          PREP_OUTCOME: ${{ steps.prep.outcome }}
+          CLAUDE_OUTCOME: ${{ steps.claude.outcome }}
+          EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+          MAX_TURNS: ${{ inputs.max-turns }}
+          STEP_TIMEOUT: ${{ steps.prep.outputs.claude-timeout }}
+          FAIL_ON_MISSING: ${{ inputs.fail-on-missing-review }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, re, shlex, subprocess, sys
+          from collections import Counter
+
+          env = os.environ
+          repo, pr, head = env['REPO'], env['PR'], env['HEAD_SHA']
+          short = head[:7]
+          d = env.get('REVIEW_DIR') or os.path.join(env.get('RUNNER_TEMP', '/tmp'), 'claude-review')
+          bot = 'github-actions[bot]'
+          marker = '<!-- claude-review:incomplete -->'
+
+          def redact(s):
+              s = re.sub(r'\b(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-ant-[A-Za-z0-9_-]{10,})', '***', s or '')
+              return re.sub(r'(?i)\b(bearer|token)\s+[A-Za-z0-9._-]{16,}', r'\1 ***', s)
+
+          def one_line(s, n):
+              s = ' '.join(redact(str(s)).split())
+              return s if len(s) <= n else s[:n - 1] + '…'
+
+          def output(**kv):
+              with open(env['GITHUB_OUTPUT'], 'a') as f:
+                  for k, v in kv.items():
+                      f.write(f'{k}={one_line(v, 900)}\n')
+
+          def summary(text):
+              with open(env['GITHUB_STEP_SUMMARY'], 'a') as f:
+                  f.write(text + '\n')
+
+          def gh(*args, data=None):
+              return subprocess.run(['gh', *args], input=data, capture_output=True, text=True)
+
+          def load(name, default=None):
+              try:
+                  with open(os.path.join(d, name), encoding='utf-8') as f:
+                      return json.load(f) if name.endswith('.json') else f.read().strip()
+              except Exception:
+                  return default
+
+          started = load('started-at', '')
+          r = gh('api', f'repos/{repo}/pulls/{pr}', '--jq', '.head.sha')
+          current = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else head
+
+          def bot_review():
+              """The newest review by the bot on the head commit. A review posted during this run
+              on a newer head (pushed meanwhile; a review without commit_id lands there) counts too."""
+              r = gh('api', '--paginate', f'repos/{repo}/pulls/{pr}/reviews?per_page=100',
+                     '--jq', '.[] | [.id, .state, (.commit_id // ""), (.submitted_at // ""), (.user.login // "")] | @tsv')
+              if r.returncode != 0:
+                  raise RuntimeError(f'reading the reviews failed: {one_line(r.stderr, 300)}')
+              found = None
+              for row in r.stdout.splitlines():
+                  rid, state, commit, at, login = (row.split('\t') + [''] * 5)[:5]
+                  if login == bot and state != 'PENDING' and (
+                          commit == head or (commit == current and started and at >= started)):
+                      found = (int(rid), state, commit[:7])
+              return found
+
+          def incomplete_comments():
+              r = gh('api', '--paginate', f'repos/{repo}/issues/{pr}/comments?per_page=100',
+                     '--jq', f'.[] | select(.user.login == "{bot}" and (.body | startswith("{marker}"))) | [.id, (.body | test("Superseded") | tostring)] | @tsv')
+              return [row.split('\t') for row in r.stdout.splitlines()] if r.returncode == 0 else []
+
+          # --- what the run left behind --------------------------------------------------
+          exec_path = env.get('EXECUTION_FILE') or os.path.join(env.get('RUNNER_TEMP', '/tmp'), 'claude-execution-output.json')
+          try:
+              with open(exec_path, encoding='utf-8') as f:
+                  messages = json.load(f)
+          except Exception:
+              messages = []
+          result = next((m for m in reversed(messages) if isinstance(m, dict) and m.get('type') == 'result'), None)
+          denials = (result or {}).get('permission_denials') or []
+          last_text = ''
+          for m in messages:
+              if isinstance(m, dict) and m.get('type') == 'assistant':
+                  for c in (m.get('message') or {}).get('content') or []:
+                      if isinstance(c, dict) and c.get('type') == 'text' and c.get('text', '').strip():
+                          last_text = c['text']
+          outcome = load('outcome.json', {})
+          outcome = outcome if isinstance(outcome, dict) else {}
+          unresolved = []
+          try:
+              with open('/tmp/unresolved-threads.json') as f:
+                  unresolved = json.load(f) or []
+          except Exception:
+              pass
+
+          def denial_label(dn):
+              tool, inp = dn.get('tool_name', '?'), dn.get('tool_input') or {}
+              if tool != 'Bash':
+                  return tool
+              cmd = str(inp.get('command', '')).strip()
+              bare = re.sub(r"'[^']*'|\"(?:\\.|[^\"\\])*\"", '', cmd)
+              if re.search(r'(^|[^0-9&>])>{1,2}\s*[^&\s]', bare) or '<<' in bare:
+                  return 'Bash(redirect to a file)'
+              heads = []
+              for seg in re.split(r'\|\|?|&&|;', (bare.splitlines() or [''])[0]):
+                  try:
+                      words = shlex.split(seg)
+                  except ValueError:
+                      words = seg.split()
+                  while words and re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', words[0]):
+                      words.pop(0)
+                  if words:
+                      n = {'gh': 3, 'git': 2, 'cargo': 2}.get(words[0], 1)
+                      heads.append(' '.join(words[:n]))
+              return f'Bash({" | ".join(heads) or "?"})'
+
+          refused = Counter(denial_label(dn) for dn in denials)
+          refused_text = ', '.join(f'{k} ×{v}' if v > 1 else k for k, v in refused.most_common(6))
+
+          print(f'Claude step: {env.get("CLAUDE_OUTCOME") or "not run"}; result: '
+                + (json.dumps({k: result.get(k) for k in ('subtype', 'is_error', 'num_turns', 'duration_ms')}) if result else 'none'))
+          for dn in denials:
+              inp = dn.get('tool_input') or {}
+              what = inp.get('command') or inp.get('file_path') or inp.get('pattern') or json.dumps(inp)[:200]
+              print(f'refused: {dn.get("tool_name")}: {one_line(what, 200)}')
+          if last_text:
+              print(f'the reviewer\'s last message: {one_line(last_text, 600)}')
+          if outcome:
+              print(f'outcome.json: {one_line(json.dumps(outcome), 400)}')
+
+          def why():
+              if env.get('PREP_OUTCOME') not in ('success', ''):
+                  return 'the PR diff could not be prepared for review (the "Prepare the diff for review" step failed)'
+              co = env.get('CLAUDE_OUTCOME', '')
+              turns = f'{result.get("num_turns")} of {env.get("MAX_TURNS")} turns' if result else ''
+              if co in ('', 'skipped'):
+                  text = 'the reviewer did not run'
+              elif result is None:
+                  text = ('the run was cancelled before the reviewer finished' if co == 'cancelled' else
+                          f'the reviewer failed or ran past its {env.get("STEP_TIMEOUT")}-minute limit before reporting a result')
+              elif result.get('subtype') == 'error_max_turns':
+                  text = f'the reviewer used all {env.get("MAX_TURNS")} turns without posting a review'
+              elif result.get('is_error') or result.get('subtype') != 'success':
+                  text = (f'the Claude run ended with an error (`{result.get("subtype")}`, is_error) after {turns} — '
+                          'usually the API, a usage limit or the credential')
+              else:
+                  text = f'the reviewer stopped after {turns} without posting a review'
+              if denials:
+                  text += f'; {len(denials)} tool call(s) were refused ({refused_text})'
+              if outcome.get('outcome') == 'blocked' and outcome.get('reason'):
+                  text += f'; the reviewer said: "{one_line(outcome["reason"], 300)}"'
+              elif outcome.get('outcome') == 'no-new-findings' and not unresolved:
+                  text += '; it reported no new findings, but with no open threads that must be an APPROVE review'
+              return text
+
+          def done(posted, state, kind, reason=''):
+              output(posted='true' if posted else 'false', state=state, outcome=kind, reason=reason)
+
+          # --- 1. a review is there --------------------------------------------------------
+          try:
+              review = bot_review()
+          except RuntimeError as e:
+              print(f'::warning title=Claude Review::{e}; not judging this run')
+              done(False, '', '', str(e))
+              sys.exit(0)
+
+          if review:
+              print(f'Review {review[0]} ({review[1]}) is on {review[2]}.')
+              for cid, superseded in incomplete_comments():
+                  if superseded != 'true':
+                      gh('api', '-X', 'PATCH', f'repos/{repo}/issues/comments/{cid}', '-f',
+                         f'body={marker}\nSuperseded: the Claude Review of `{short}` was posted.')
+              summary(f'### Claude Review: {review[1]} on `{review[2]}`')
+              done(True, review[1], 'posted')
+              sys.exit(0)
+
+          # --- 2. a newer commit was pushed meanwhile: its own run reviews it -----------------
+          if current != head:
+              msg = f'No review on {short}, but the PR has moved on to {current[:7]}: the review of that commit decides.'
+              print(f'::notice title=Claude Review::{msg}')
+              summary(f'### Claude Review: superseded\n\n{msg}')
+              done(False, '', 'superseded')
+              sys.exit(0)
+
+          # --- 3. a re-review with nothing new (rule 3) --------------------------------------
+          if outcome.get('outcome') == 'no-new-findings' and unresolved:
+              msg = (f'No new review on {short}: {len(unresolved)} open review thread(s) already cover the findings '
+                     f'({one_line(outcome.get("reason", ""), 200)}).')
+              print(f'::notice title=Claude Review::{msg}')
+              summary(f'### Claude Review: no new review\n\n{msg}')
+              done(False, '', 'no-new-findings')
+              sys.exit(0)
+
+          reason = why()
+          level = 'error' if env.get('FAIL_ON_MISSING', 'true') == 'true' else 'warning'
+
+          # --- 4. the reviewer's draft was never posted: post it, marked incomplete -------
+          draft = load('review.json', None)
+          if isinstance(draft, dict) and str(draft.get('body') or '').strip():
+              lines = load('lines.json', {}) or {}
+
+              def placeable(path, line, side):
+                  try:
+                      return int(line) in set(lines.get(path, {}).get(side, []))
+                  except (TypeError, ValueError):
+                      return False
+
+              kept, moved = [], []
+              for c in draft.get('comments') or []:
+                  if not isinstance(c, dict):
+                      continue
+                  side = str(c.get('side') or 'RIGHT').upper()
+                  if placeable(c.get('path'), c.get('line'), side):
+                      kc = {'path': c['path'], 'line': int(c['line']), 'side': side, 'body': str(c.get('body', ''))}
+                      ss = str(c.get('start_side') or side).upper()
+                      if c.get('start_line') and placeable(c['path'], c['start_line'], ss) and int(c['start_line']) < kc['line']:
+                          kc.update(start_line=int(c['start_line']), start_side=ss)
+                      kept.append(kc)
+                  else:
+                      moved.append(f'- `{c.get("path")}:{c.get("line")}` — {c.get("body", "")}')
+              asked = str(draft.get('event') or 'COMMENT').upper()
+              event = 'REQUEST_CHANGES' if asked == 'REQUEST_CHANGES' else 'COMMENT'
+              note = (f'> **Incomplete review.** The reviewer wrote this draft but didn\'t post it ({reason}); '
+                      f'the workflow posted it{" as a comment, not an approval" if asked == "APPROVE" else ""}. '
+                      f'[The run]({env["RUN_URL"]}).\n\n')
+              body = note + str(draft['body'])
+              if moved:
+                  body += '\n\n### Comments that could not be placed on a diff line\n' + '\n'.join(moved)
+              payload = {'commit_id': head, 'event': event, 'body': body, 'comments': kept}
+              r = gh('api', '-X', 'POST', f'repos/{repo}/pulls/{pr}/reviews', '--input', '-', data=json.dumps(payload))
+              if r.returncode != 0 and kept:
+                  payload['body'] += '\n\n### Inline comments (the API refused them inline)\n' + '\n'.join(
+                      f'- `{c["path"]}:{c["line"]}` — {c["body"]}' for c in kept)
+                  payload['comments'] = []
+                  r = gh('api', '-X', 'POST', f'repos/{repo}/pulls/{pr}/reviews', '--input', '-', data=json.dumps(payload))
+              if r.returncode == 0:
+                  state = {'REQUEST_CHANGES': 'CHANGES_REQUESTED', 'COMMENT': 'COMMENTED'}[event]
+                  msg = f'The reviewer did not finish; its unposted draft is posted on {short} as an incomplete review ({state}): {reason}.'
+                  summary(f'### Claude Review: incomplete ({state}) on `{short}`\n\n{redact(msg)}')
+                  done(True, state, 'salvaged', reason)
+                  print(f'::{level} title=Claude Review::{one_line(msg, 900)}')
+                  sys.exit(1 if level == 'error' else 0)
+              print(f'Posting the draft failed: {one_line(r.stderr or r.stdout, 300)}')
+
+          # --- 5. no review: say so on the PR, fail the job ------------------------------
+          text = (f'{marker}\n**Claude Review could not complete** on `{short}`: {reason}.\n\n'
+                  f'No review was posted for this commit, so treat the PR as unreviewed. '
+                  f'[The run]({env["RUN_URL"]}) has the details; re-run its "Claude Review" job to try again.')
+          existing = [cid for cid, _ in incomplete_comments()]
+          if existing:
+              r = gh('api', '-X', 'PATCH', f'repos/{repo}/issues/comments/{existing[-1]}', '-f', f'body={text}')
+          else:
+              r = gh('api', '-X', 'POST', f'repos/{repo}/issues/{pr}/comments', '-f', f'body={text}')
+          if r.returncode != 0:
+              print(f'Commenting on the PR failed: {one_line(r.stderr, 300)}')
+          summary(f'### Claude Review could not complete on `{short}`\n\n{redact(reason)}.'
+                  + (f'\n\nRefused tool calls: {refused_text}.' if denials else ''))
+          done(False, '', 'missing', reason)
+          print(f'::{level} title=Claude Review::{one_line("No review on " + short + ": " + reason, 900)}')
+          sys.exit(1 if level == 'error' else 0)
+          PYEOF
 
       - name: Resolve addressed threads and dismiss stale reviews
         if: always()
