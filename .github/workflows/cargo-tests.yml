@@ -355,6 +355,7 @@ jobs:
             exit 1
           fi
           echo "dir=$RUNNER_TEMP/cargo-tests-archive" >> "$GITHUB_OUTPUT"
+          echo "CARGO_TESTS_DOWNLOAD_T0=$(date +%s)" >> "$GITHUB_ENV"
 
       - name: Download the test archive
         id: download
@@ -380,7 +381,9 @@ jobs:
         run: |
           set -euo pipefail
           file="$DIR/${ARCHIVE_FILE:-$ARTIFACT.tar.zst}"
-          ls -l "$file"
+          down=$(( $(date +%s) - ${CARGO_TESTS_DOWNLOAD_T0:-$(date +%s)} ))
+          size=$(stat -c %s "$file")
+          echo "Downloaded $(( size / 1048576 )) MiB in ${down}s."
           # The build's paths, mapped onto this job's checkout (the same
           # path on every pod of one repository's runners).
           ws="$BUILD_WORKSPACE_ROOT"; td="$BUILD_TARGET_DIR"
@@ -399,7 +402,9 @@ jobs:
           start=$(date +%s)
           cargo nextest list --archive-file "$file" --workspace-remap "$ws" \
             --extract-to "$to" --extract-overwrite --list-type binaries-only > /dev/null
-          echo "Extracted $(du -sh "$to/target" | cut -f1) to $td in $(( $(date +%s) - start ))s; this lane builds nothing."
+          ext=$(( $(date +%s) - start ))
+          echo "Extracted $(du -sh "$to/target" | cut -f1) to $td in ${ext}s; this lane builds nothing."
+          echo "### Ran from the shared test archive: downloaded $(( size / 1048576 )) MiB in ${down}s, extracted in ${ext}s; nothing built" >> "$GITHUB_STEP_SUMMARY"
           rm -f "$file"
           {
             echo "CARGO_TESTS_TARGET_DIR=$td"

@@ -204,6 +204,18 @@ on:
           and list, per lane, the workspace crates whose features differ in
           the `cargo-tests-archive` job summary. `strict`: those lanes build
           on their own instead. `off`: skip the check.
+      cargo-tests-archive-warn-mib:
+        type: number
+        default: 2048
+        description: |
+          Warn (annotation + job summary) when one run's test archives add
+          up to more than this many MiB. Every archive is uploaded once and
+          each lane downloads its own; on trading's runners that moved about
+          9 MB/s up, so 9 GB of archives cost 17 minutes before any lane
+          started. The fixes: fewer test binaries (each statically links the
+          whole dependency graph), `CARGO_PROFILE_TEST_STRIP=debuginfo` in
+          `cargo-tests-build-env` (about 28 % smaller, at the cost of line
+          numbers in backtraces), or `cargo-tests-build-once: false`.
       cargo-tests-archive-retention-days:
         type: number
         default: 1
@@ -971,8 +983,10 @@ jobs:
           done
           secs=$(( $(date +%s) - start ))
           meta=$(cargo metadata --no-deps --format-version 1 --manifest-path "$manifest")
+          echo "CARGO_TESTS_UPLOAD_T0=$(date +%s)" >> "$GITHUB_ENV"
           {
             echo "dir=$dir"
+            echo "total-bytes=$total"
             echo "lane-archives=$archives"
             echo "target-dir=$(jq -r .target_directory <<<"$meta")"
             echo "workspace-root=$(jq -r .workspace_root <<<"$meta")"
@@ -1124,7 +1138,24 @@ jobs:
       - name: Archive ready
         id: ready
         if: steps.archive.outcome == 'success'
-        run: echo "status=ready" >> "$GITHUB_OUTPUT"
+        shell: bash
+        env:
+          TOTAL: ${{ steps.archive.outputs.total-bytes }}
+          WARN_MIB: ${{ inputs.cargo-tests-archive-warn-mib }}
+        run: |
+          secs=$(( $(date +%s) - ${CARGO_TESTS_UPLOAD_T0:-$(date +%s)} ))
+          mib=$(( TOTAL / 1048576 ))
+          rate=$(awk -v b="$TOTAL" -v s="$secs" 'BEGIN { if (s > 0) printf "%.1f MB/s", b / s / 1e6; else print "n/a" }')
+          {
+            echo
+            echo "Uploaded ${mib} MiB of test archives in $((secs / 60))m$((secs % 60))s ($rate)."
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$mib" -gt "${WARN_MIB:-2048}" ]; then
+            msg="the test archives are ${mib} MiB (over cargo-tests-archive-warn-mib, ${WARN_MIB} MiB) and took $((secs / 60))m$((secs % 60))s to upload; every lane waits for that and then downloads its share. Fewer test binaries (each links the whole dependency graph) is the fix; CARGO_PROFILE_TEST_STRIP=debuginfo in cargo-tests-build-env saves about a quarter; cargo-tests-build-once: false goes back to per-lane builds."
+            echo "::warning title=cargo-tests archive size::$msg"
+            { echo; echo "> **Warning:** $msg"; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "status=ready" >> "$GITHUB_OUTPUT"
 
       - name: Doc tests
         id: doctests
