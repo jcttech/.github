@@ -1425,7 +1425,9 @@ jobs:
       matrix:
         entry: ${{ fromJson(needs.changes.outputs.cargo-tests-lanes || inputs.cargo-tests) }}
     # Pinned to this workflow's own major: the lanes need the v3 inputs.
-    uses: jcttech/.github/.github/workflows/cargo-tests.yml@v3
+    # On `fix/cargo-tests-archive-missing-notice` it points at the branch so
+    # the change can be run; it goes back to `@v3` in the last commit.
+    uses: jcttech/.github/.github/workflows/cargo-tests.yml@fix/cargo-tests-archive-missing-notice
     secrets: inherit
     with:
       # `${{ expr || 'default' }}` fallbacks here are load-bearing —
