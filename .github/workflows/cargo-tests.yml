@@ -369,43 +369,74 @@ jobs:
       # place (one sequential read for the checksum, which leaves the file
       # in the page cache for the extraction's read). Missing or
       # mismatched: the lane falls back to its own build, as for an
-      # expired artifact.
+      # expired artifact. The step never fails: it reports through its
+      # outputs (`file`, or `reason`), so a lane that falls back and passes
+      # carries no error annotation, only the fallback's one warning.
       - name: Read the test archive from the shared volume
         id: shared
         if: steps.mode.outcome == 'success' && inputs.archive-path != ''
-        continue-on-error: true
         shell: bash
         env:
-          NAME: ${{ inputs.name }}
           ARCHIVE_PATH: ${{ inputs.archive-path }}
         run: |
           set -uo pipefail
           t0=$(date +%s)
+          reason() { echo "reason=$1" >> "$GITHUB_OUTPUT"; echo "$1"; exit 0; }
           if [ ! -f "$ARCHIVE_PATH" ]; then
-            echo "::warning title=$NAME::$ARCHIVE_PATH isn't on this job's shared volume (mounted here? the same volume as the archive job's?)"
-            exit 1
+            # <dir>/<owner>/<repo>/<run_id>/cargo-tests-archive-<hash>/lane-<n>.tar.zst
+            pipe_dir=$(dirname "$ARCHIVE_PATH"); run_dir=$(dirname "$pipe_dir")
+            root=$(dirname "$(dirname "$(dirname "$run_dir")")")
+            attempt="${GITHUB_RUN_ATTEMPT:-1}"
+            c_clean="this run's archives were deleted after every lane passed (cargo-tests-archive-cleanup), which is what a re-run of a finished green run finds"
+            c_sweep="they were swept after cargo-tests-archive-retention-days (each archive job sweeps older runs)"
+            c_mount="the shared volume isn't mounted in this job"
+            mwhy=""
+            if [ ! -d "$root" ]; then mwhy="$root doesn't exist here"
+            else
+              mnt=$(df -P "$root" 2>/dev/null | awk 'NR == 2 { print $6 }')
+              if [ -z "$mnt" ] || [ "$mnt" = / ]; then mwhy="$root is on the container's own filesystem"; fi
+            fi
+            if [ -n "$mwhy" ]; then
+              reason "no test archive at $ARCHIVE_PATH. Most likely: $c_mount ($mwhy). Otherwise: $c_clean; or $c_sweep."
+            elif [ ! -d "$pipe_dir" ] && [ "$attempt" -gt 1 ]; then
+              gone="$pipe_dir"; [ -d "$run_dir" ] || gone="$run_dir"
+              reason "no test archive at $ARCHIVE_PATH. Most likely: $c_clean (this is attempt $attempt; the volume is mounted$([ -w "$root" ] && echo " and writable") and $gone is gone). Otherwise: $c_sweep."
+            elif [ ! -d "$pipe_dir" ]; then
+              gone="$pipe_dir"; [ -d "$run_dir" ] || gone="$run_dir"
+              reason "no test archive at $ARCHIVE_PATH: $gone is gone although the volume is mounted. Causes, most likely first: $c_clean; $c_sweep."
+            else
+              reason "no test archive at $ARCHIVE_PATH: $pipe_dir exists but this lane's file isn't in it (the archive job didn't write it?). Other causes: $c_clean; $c_sweep."
+            fi
           fi
           want=$(awk 'NR == 1 { print $1 }' "$ARCHIVE_PATH.sha256" 2>/dev/null)
           got=$(sha256sum "$ARCHIVE_PATH" | awk '{ print $1 }')
           if [ -z "$want" ] || [ "$want" != "$got" ]; then
-            echo "::warning title=$NAME::$ARCHIVE_PATH failed its SHA-256 check (expected ${want:-none}, got $got)"
-            exit 1
+            reason "$ARCHIVE_PATH failed its SHA-256 check: $ARCHIVE_PATH.sha256 says ${want:-nothing}, the file is $got"
           fi
           echo "Verified $ARCHIVE_PATH ($(( $(stat -c %s "$ARCHIVE_PATH") / 1048576 )) MiB, SHA-256 $got) in $(( $(date +%s) - t0 ))s."
           echo "file=$ARCHIVE_PATH" >> "$GITHUB_OUTPUT"
 
+      # A `pattern` (the exact artifact name) rather than `name`: an artifact
+      # that's gone downloads nothing instead of failing the step, and the
+      # extraction below reports it. `merge-multiple` keeps the file where a
+      # `name` download puts it. A real download error still fails this step
+      # (and the lane falls back, as before).
       - name: Download the test archive
         id: download
         if: steps.mode.outcome == 'success' && inputs.archive-path == ''
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
-          name: ${{ inputs.archive-artifact }}
+          pattern: ${{ inputs.archive-artifact }}
+          merge-multiple: true
           path: ${{ steps.mode.outputs.dir }}
 
       - name: Extract the test archive
         id: extract
-        if: steps.download.outcome == 'success' || steps.shared.outcome == 'success'
+        if: >-
+          steps.mode.outcome == 'success' &&
+          (steps.shared.outputs.file != '' ||
+           (inputs.archive-path == '' && steps.download.outcome == 'success'))
         continue-on-error: true
         shell: bash
         env:
@@ -419,6 +450,16 @@ jobs:
         run: |
           set -euo pipefail
           file="${SHARED_FILE:-$DIR/${ARCHIVE_FILE:-$ARTIFACT.tar.zst}}"
+          if [ ! -f "$file" ]; then
+            attempt="${GITHUB_RUN_ATTEMPT:-1}"
+            if [ "$attempt" -gt 1 ]; then
+              why="Most likely it was deleted after every lane passed (cargo-tests-archive-cleanup): this is attempt $attempt, a re-run of a finished run. Otherwise it expired after cargo-tests-archive-retention-days."
+            else
+              why="It was deleted after every lane passed (cargo-tests-archive-cleanup) or expired after cargo-tests-archive-retention-days."
+            fi
+            echo "reason=the artifact $ARTIFACT isn't in this run any more. $why" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           down=$(( $(date +%s) - ${CARGO_TESTS_DOWNLOAD_T0:-$(date +%s)} ))
           size=$(stat -c %s "$file")
           if [ -n "$SHARED_FILE" ]; then how="read in place from the shared volume ($SHARED_FILE, checksum verified)"; else how="downloaded"; fi
@@ -451,13 +492,26 @@ jobs:
           } >> "$GITHUB_ENV"
           echo "mode=archive" >> "$GITHUB_OUTPUT"
 
+      # The one warning a fallback raises, with the cause the steps above
+      # found; the summary line after the tests says what the build cost.
       - name: Fall back to building this lane
+        id: fallback
         if: steps.mode.outcome == 'success' && steps.extract.outputs.mode != 'archive'
         env:
           NAME: ${{ inputs.name }}
-          ARTIFACT: ${{ inputs.archive-artifact }}
+          REASON: >-
+            ${{ steps.shared.outputs.reason || steps.extract.outputs.reason ||
+                (steps.download.outcome == 'failure' && 'downloading the test archive failed (the step''s error is above)') ||
+                (steps.extract.outcome == 'failure' && 'extracting the test archive failed (the step''s error is above)') ||
+                'the test archive could not be read' }}
         run: |
-          echo "::warning title=$NAME::the test archive $ARTIFACT could not be read (an artifact expires after cargo-tests-archive-retention-days; a shared-volume copy can be missing or fail its checksum) or extracted, so this lane builds its own test binaries"
+          echo "::warning title=$NAME builds its own test binaries::$REASON"
+          echo "CARGO_TESTS_FALLBACK_T0=$(date +%s)" >> "$GITHUB_ENV"
+          {
+            echo "### Built its own test binaries (no shared test archive)"
+            echo
+            echo "$REASON"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Check there is a command to run
         if: >-
@@ -529,6 +583,13 @@ jobs:
         if: steps.gate.outputs.should-run == 'true' && inputs.with-postgres != 'true'
         working-directory: ${{ inputs.working-directory }}
         run: ${{ (steps.extract.outputs.mode == 'archive' && inputs.archive-command) || inputs.command }}
+
+      - name: Report the lane's own build
+        if: >-
+          !cancelled() && steps.fallback.outcome == 'success'
+        run: |
+          secs=$(( $(date +%s) - ${CARGO_TESTS_FALLBACK_T0:-$(date +%s)} ))
+          echo "This lane built and ran its own tests in $((secs / 60))m$((secs % 60))s (from the archive it would have built nothing)." >> "$GITHUB_STEP_SUMMARY"
 
       # Doc tests aren't in a nextest archive: the archive job ran them once
       # against its build. A lane that asked for them fails here on its own.
